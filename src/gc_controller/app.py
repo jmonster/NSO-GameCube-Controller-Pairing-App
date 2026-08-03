@@ -46,6 +46,15 @@ from .controller_constants import (
 from .i18n import t
 from .settings_manager import SettingsManager
 
+# Rumble drive tuning. The controller's vibration command is binary and stops
+# on its own, so sustained rumble needs periodic re-sending and intensities
+# below 100% are approximated by pulsing.
+_RUMBLE_REFRESH_MS = 45       # re-send interval that keeps the motor running
+_RUMBLE_MIN_PULSE_MS = 12     # shortest pulse Tk timers can deliver reliably
+_RUMBLE_MAX_PERIOD_MS = 400   # longest gap between pulses at the weakest setting
+_RUMBLE_CURVE = 1.8           # >1 makes the lower half of the slider much softer
+_RUMBLE_MIN_DUTY = _RUMBLE_MIN_PULSE_MS / _RUMBLE_MAX_PERIOD_MS
+
 
 def setup_logging(debug: bool = False):
     """Configure logging for the application.
@@ -2374,14 +2383,14 @@ class GCControllerEnabler:
                     (desired > 0) == (slot.rumble_desired > 0)):
                 return
             slot.rumble_desired = desired
-            # Schedule PWM update on the Tk main thread
+            # Drive the motor from the Tk main thread
             self.root.after(0, lambda si=slot_index: self._sync_rumble_output(si))
         return _on_rumble
 
-    def _set_rumble_hardware(self, slot_index: int, on: bool):
+    def _set_rumble_hardware(self, slot_index: int, on: bool, force: bool = False):
         """Send a binary rumble ON/OFF command to the connected controller."""
         slot = self.slots[slot_index]
-        if on == slot.rumble_state:
+        if on == slot.rumble_state and not force:
             return
         slot.rumble_state = on
         packet = build_rumble_packet(on, slot.rumble_tid)
@@ -2397,7 +2406,7 @@ class GCControllerEnabler:
             slot.conn_mgr.send_rumble(on)
 
     def _stop_rumble_pwm(self, slot_index: int):
-        """Cancel any in-progress rumble PWM timer for a slot."""
+        """Cancel any in-progress rumble drive timer for a slot."""
         timer_id = self._rumble_pwm_timers.pop(slot_index, None)
         if timer_id is not None:
             try:
@@ -2405,43 +2414,57 @@ class GCControllerEnabler:
             except Exception:
                 pass
 
+    @staticmethod
+    def _rumble_pulse_timing(level: float) -> tuple[int, int]:
+        """Return (on_ms, off_ms) for a 0-1 level; off_ms of 0 means continuous."""
+        level = max(0.0, min(1.0, level))
+        if level >= 0.995:
+            return (_RUMBLE_REFRESH_MS, 0)
+
+        duty = max(_RUMBLE_MIN_DUTY, level ** _RUMBLE_CURVE)
+        on_ms = max(_RUMBLE_MIN_PULSE_MS, int(round(_RUMBLE_REFRESH_MS * duty)))
+        period_ms = min(_RUMBLE_MAX_PERIOD_MS,
+                        max(_RUMBLE_REFRESH_MS, int(round(on_ms / duty))))
+        return (on_ms, max(0, period_ms - on_ms))
+
     def _sync_rumble_output(self, slot_index: int):
-        """Apply current desired rumble level (continuous or PWM)."""
+        """Start or stop the rumble drive loop for a slot."""
+        if self.slots[slot_index].rumble_desired <= 0.001:
+            self._stop_rumble_pwm(slot_index)
+            self._set_rumble_hardware(slot_index, False)
+            return
+        # A running loop re-reads the level each cycle, so don't restart it.
+        if self._rumble_pwm_timers.get(slot_index) is None:
+            self._rumble_cycle(slot_index)
+
+    def _rumble_cycle(self, slot_index: int):
+        """Run one rumble pulse and schedule the next one."""
         slot = self.slots[slot_index]
-        desired = slot.rumble_desired
-        self._stop_rumble_pwm(slot_index)
-
-        if desired <= 0.01:
+        if (slot.rumble_desired <= 0.001
+                or not (slot.ble_connected or slot.conn_mgr.device)):
+            self._rumble_pwm_timers.pop(slot_index, None)
             self._set_rumble_hardware(slot_index, False)
             return
 
-        if desired >= 0.99:
-            self._set_rumble_hardware(slot_index, True)
+        on_ms, off_ms = self._rumble_pulse_timing(slot.rumble_desired)
+        # Always re-send: the vibration command expires on the controller,
+        # so even continuous rumble has to be refreshed to stay at strength.
+        self._set_rumble_hardware(slot_index, True, force=True)
+
+        if off_ms <= 0:
+            self._rumble_pwm_timers[slot_index] = self.root.after(
+                on_ms, lambda si=slot_index: self._rumble_cycle(si))
             return
 
-        # Soft PWM: on for duty*period, off for the remainder, then repeat
-        period_ms = 50
-        on_ms = max(5, int(period_ms * desired))
-        off_ms = max(5, period_ms - on_ms)
-
-        def _pwm_on():
-            if self.slots[slot_index].rumble_desired <= 0.01:
-                self._set_rumble_hardware(slot_index, False)
+        def _pulse_off(si=slot_index, gap=off_ms):
+            self._set_rumble_hardware(si, False)
+            if self.slots[si].rumble_desired <= 0.001:
+                self._rumble_pwm_timers.pop(si, None)
                 return
-            self._set_rumble_hardware(slot_index, True)
-            self._rumble_pwm_timers[slot_index] = self.root.after(on_ms, _pwm_off)
+            self._rumble_pwm_timers[si] = self.root.after(
+                gap, lambda: self._rumble_cycle(si))
 
-        def _pwm_off():
-            if self.slots[slot_index].rumble_desired <= 0.01:
-                self._set_rumble_hardware(slot_index, False)
-                return
-            if self.slots[slot_index].rumble_desired >= 0.99:
-                self._set_rumble_hardware(slot_index, True)
-                return
-            self._set_rumble_hardware(slot_index, False)
-            self._rumble_pwm_timers[slot_index] = self.root.after(off_ms, _pwm_on)
-
-        _pwm_on()
+        self._rumble_pwm_timers[slot_index] = self.root.after(on_ms, _pulse_off)
 
     def test_rumble(self, slot_index: int):
         """Send a short rumble burst (~500ms) to test the motor."""
