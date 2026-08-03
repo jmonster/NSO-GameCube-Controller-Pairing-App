@@ -543,6 +543,7 @@ class GCControllerEnabler:
 
         if self._needs_calibration(slot_index):
             self.ui.update_status(slot_index, t("ui.new_controller_cal"))
+            self.root.after(500, lambda si=slot_index: self._start_auto_calibration(si))
 
     def _reset_rumble(self, slot_index: int):
         """Send rumble OFF if currently ON and reset rumble state."""
@@ -1152,6 +1153,7 @@ class GCControllerEnabler:
             self.ui.update_ble_status(slot_index, t("ble.connected", mac=mac))
             if self._needs_calibration(slot_index):
                 self.ui.update_status(slot_index, t("ui.new_controller_cal"))
+                self.root.after(500, lambda si=slot_index: self._start_auto_calibration(si))
             else:
                 self.ui.update_status(slot_index, t("ui.connected_ble"))
             self.ui.update_tab_status(
@@ -2493,6 +2495,17 @@ class GCControllerEnabler:
     def _needs_calibration(self, slot_index: int) -> bool:
         """Check if a slot has default (uncalibrated) stick calibration."""
         return self.slot_calibrations[slot_index].get('stick_left_octagon') is None
+
+    def _start_auto_calibration(self, slot_index: int):
+        """Start the calibration wizard automatically for a newly connected controller."""
+        if not self.slots[slot_index].is_connected:
+            return
+        # Wait until the controller is actually producing HID data before starting
+        if self._latest_ui_data[slot_index] is None:
+            self.root.after(500, lambda si=slot_index: self._start_auto_calibration(si))
+            return
+        self.ui.update_status(slot_index, t("ui.auto_cal_starting"))
+        self.calibration_wizard_step(slot_index)
 
     def calibration_wizard_step(self, slot_index: int):
         """Unified calibration wizard: sticks first, then triggers, one button."""

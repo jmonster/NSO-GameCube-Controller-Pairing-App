@@ -234,6 +234,15 @@ _STRINGS: dict[str, dict[str, str]] = {
         "pt": "Conectado \u2014 clique em Calibração para configurar",
         "it": "Connesso \u2014 clicca su Calibrazione per configurare",
     },
+    "ui.auto_cal_starting": {
+        "en": "New controller \u2014 starting calibration...",
+        "fr": "Nouvelle manette \u2014 démarrage de la calibration...",
+        "ja": "新しいコントローラー \u2014 キャリブレーションを開始...",
+        "es": "Nuevo mando \u2014 iniciando calibración...",
+        "de": "Neuer Controller \u2014 Kalibrierung startet...",
+        "pt": "Novo controle \u2014 iniciando calibração...",
+        "it": "Nuovo controller \u2014 avvio calibrazione...",
+    },
     "ui.dual_connection_warning": {
         "en": "Connected via USB and Bluetooth \u2014 you may want to disconnect one",
         "fr": "Connectée en USB et Bluetooth \u2014 vous pouvez déconnecter l'un des deux",
