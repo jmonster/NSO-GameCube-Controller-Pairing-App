@@ -39,7 +39,8 @@ class SlotUI:
         self.controller_visual: Optional[GCControllerVisual] = None
 
         # Calibration
-        self.cal_wizard_btn = None
+        self.cal_sticks_btn = None
+        self.cal_triggers_btn = None
         self.cal_cancel_btn = None
 
 
@@ -50,7 +51,8 @@ class ControllerUI:
                  slot_calibrations: List[dict],
                  slot_cal_mgrs: List[CalibrationManager],
                  on_connect: Callable[[int], None],
-                 on_cal_wizard: Callable[[int], None],
+                 on_cal_sticks: Callable[[int], None],
+                 on_cal_triggers: Callable[[int], None],
                  on_save: Callable,
                  on_pair: Optional[Callable[[int], None]] = None,
                  on_cal_cancel: Optional[Callable[[int], None]] = None,
@@ -83,6 +85,10 @@ class ControllerUI:
         self.minimize_to_tray_var = tk.BooleanVar(value=slot_calibrations[0].get('minimize_to_tray', False))
         self.auto_scan_ble_var = tk.BooleanVar(value=slot_calibrations[0].get('auto_scan_ble', True))
         self.stick_deadzone_var = tk.DoubleVar(value=slot_calibrations[0].get('stick_deadzone', 0.05))
+        self.map_home_to_guide_var = tk.BooleanVar(
+            value=slot_calibrations[0].get('map_home_to_guide', True))
+        self.rumble_intensity_var = tk.DoubleVar(
+            value=slot_calibrations[0].get('rumble_intensity', 1.0))
         self.run_at_startup_var = tk.BooleanVar(value=slot_calibrations[0].get('run_at_startup', False))
 
         # Callbacks for settings dialog
@@ -111,13 +117,13 @@ class ControllerUI:
         self._BLE_SCAN_LED_SEQ = [0, 1, 2, 3, 2, 1]  # bounce pattern
 
         self.slots: List[SlotUI] = []
-        self._setup(on_connect, on_cal_wizard, on_save, on_pair, on_cal_cancel)
+        self._setup(on_connect, on_cal_sticks, on_cal_triggers, on_save, on_pair, on_cal_cancel)
 
         self._initializing = False
 
     # ── Setup ────────────────────────────────────────────────────────
 
-    def _setup(self, on_connect, on_cal_wizard, on_save, on_pair=None,
+    def _setup(self, on_connect, on_cal_sticks, on_cal_triggers, on_save, on_pair=None,
                on_cal_cancel=None):
         """Create the user interface with tabview tabs."""
         outer_frame = customtkinter.CTkFrame(self._root, fg_color="transparent")
@@ -170,7 +176,7 @@ class ControllerUI:
 
             slot_ui = SlotUI()
             self._build_tab(i, slot_ui, on_connect,
-                            on_cal_wizard, on_pair, on_cal_cancel)
+                            on_cal_sticks, on_cal_triggers, on_pair, on_cal_cancel)
             self.slots.append(slot_ui)
 
         # Track global setting changes — auto-save when changed
@@ -189,9 +195,12 @@ class ControllerUI:
         self.minimize_to_tray_var.trace_add('write', _on_setting_changed)
         self.auto_scan_ble_var.trace_add('write', _on_setting_changed)
         self.stick_deadzone_var.trace_add('write', _on_setting_changed)
+        self.map_home_to_guide_var.trace_add('write', _on_setting_changed)
+        self.rumble_intensity_var.trace_add('write', _on_setting_changed)
+        self.run_at_startup_var.trace_add('write', _on_setting_changed)
 
     def _build_tab(self, index: int, slot_ui: SlotUI,
-                   on_connect, on_cal_wizard,
+                   on_connect, on_cal_sticks, on_cal_triggers,
                    on_pair=None, on_cal_cancel=None):
         """Build one controller tab."""
         tab_name = self._tab_names[index]
@@ -266,12 +275,19 @@ class ControllerUI:
             )
             slot_ui.pair_btn.pack(side=tk.LEFT, padx=4, expand=True, fill=tk.X)
 
-        slot_ui.cal_wizard_btn = customtkinter.CTkButton(
-            btn_frame, text=t("ui.cal_wizard"),
-            command=lambda i=index: on_cal_wizard(i),
+        slot_ui.cal_triggers_btn = customtkinter.CTkButton(
+            btn_frame, text=t("ui.cal_triggers"),
+            command=lambda i=index: on_cal_triggers(i),
             **btn_kwargs,
         )
-        slot_ui.cal_wizard_btn.pack(side=tk.LEFT, padx=(4, 0), expand=True, fill=tk.X)
+        slot_ui.cal_triggers_btn.pack(side=tk.LEFT, padx=(4, 0), expand=True, fill=tk.X)
+
+        slot_ui.cal_sticks_btn = customtkinter.CTkButton(
+            btn_frame, text=t("ui.cal_sticks"),
+            command=lambda i=index: on_cal_sticks(i),
+            **btn_kwargs,
+        )
+        slot_ui.cal_sticks_btn.pack(side=tk.LEFT, padx=(4, 0), expand=True, fill=tk.X)
 
         if on_cal_cancel:
             slot_ui.cal_cancel_btn = customtkinter.CTkButton(
@@ -299,6 +315,8 @@ class ControllerUI:
             auto_connect_var=self.auto_connect_var,
             minimize_to_tray_var=self.minimize_to_tray_var,
             stick_deadzone_var=self.stick_deadzone_var,
+            map_home_to_guide_var=self.map_home_to_guide_var,
+            rumble_intensity_var=self.rumble_intensity_var,
             auto_scan_ble_var=self.auto_scan_ble_var,
             run_at_startup_var=self.run_at_startup_var,
             on_emulate_all=self._on_emulate_all if self._on_emulate_all else lambda: None,
@@ -400,7 +418,7 @@ class ControllerUI:
         if self.auto_connect_var.get():
             s.connect_btn.pack_forget()
         elif not s.connect_btn.winfo_ismapped():
-            before = s.pair_btn if s.pair_btn and s.pair_btn.winfo_ismapped() else s.cal_wizard_btn
+            before = s.pair_btn if s.pair_btn and s.pair_btn.winfo_ismapped() else s.cal_triggers_btn
             s.connect_btn.pack(side=tk.LEFT, padx=(0, 4), expand=True, fill=tk.X, before=before)
 
     def _refresh_tab_title(self, slot_index: int):

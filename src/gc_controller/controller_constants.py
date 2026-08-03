@@ -84,6 +84,8 @@ DEFAULT_CALIBRATION = {
     'stick_right_center_x': 2048, 'stick_right_range_x': 1150,
     'stick_right_center_y': 2048, 'stick_right_range_y': 1200,
     'stick_deadzone': 0.05,
+    'map_home_to_guide': True,
+    'rumble_intensity': 1.0,
     'auto_connect': True,
     'auto_scan_ble': True,
     'minimize_to_tray': True,

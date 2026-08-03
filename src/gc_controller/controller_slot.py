@@ -52,6 +52,7 @@ class ControllerSlot:
         # Rumble state
         self.rumble_tid: int = 0
         self.rumble_state: bool = False
+        self.rumble_desired: float = 0.0  # 0.0–1.0 effective intensity from host × setting
 
         self.cal_mgr = CalibrationManager(calibration)
         self.conn_mgr = ConnectionManager(on_status=on_status, on_progress=on_progress)

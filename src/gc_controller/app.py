@@ -187,7 +187,8 @@ class GCControllerEnabler:
             del assignments[k]
 
         # Propagate per-slot global settings from slot 0 to all other slots
-        for key in ('trigger_bump_100_percent', 'emulation_mode', 'stick_deadzone'):
+        for key in ('trigger_bump_100_percent', 'emulation_mode', 'stick_deadzone',
+                    'map_home_to_guide', 'rumble_intensity'):
             val = self.slot_calibrations[0].get(key)
             if val is not None:
                 for i in range(1, MAX_SLOTS):
@@ -214,6 +215,7 @@ class GCControllerEnabler:
         # reads these at a fixed rate (~30 fps) so updates are naturally coalesced.
         self._latest_ui_data = [None] * MAX_SLOTS
         self._trigger_cal_live_timers: dict[int, str | None] = {}
+        self._rumble_pwm_timers: dict[int, str | None] = {}
 
         # BLE state (lazy-initialized on first pair via privileged subprocess)
         self._ble_available = is_ble_available()
@@ -254,7 +256,8 @@ class GCControllerEnabler:
             slot_calibrations=self.slot_calibrations,
             slot_cal_mgrs=[s.cal_mgr for s in self.slots],
             on_connect=self.connect_controller,
-            on_cal_wizard=self.calibration_wizard_step,
+            on_cal_sticks=self.calibration_sticks_step,
+            on_cal_triggers=self.calibration_triggers_step,
             on_save=self.save_settings,
             on_pair=self.pair_controller if self._ble_available else None,
             on_cal_cancel=self.cancel_calibration,
@@ -548,19 +551,11 @@ class GCControllerEnabler:
     def _reset_rumble(self, slot_index: int):
         """Send rumble OFF if currently ON and reset rumble state."""
         slot = self.slots[slot_index]
+        slot.rumble_desired = 0.0
+        self._stop_rumble_pwm(slot_index)
         if not slot.rumble_state:
             return
-        slot.rumble_state = False
-        packet = build_rumble_packet(False, slot.rumble_tid)
-        slot.rumble_tid = (slot.rumble_tid + 1) & 0x0F
-        if slot.ble_connected:
-            self._send_ble_cmd({
-                "cmd": "rumble",
-                "slot_index": slot_index,
-                "data": base64.b64encode(packet).decode('ascii'),
-            })
-        elif slot.conn_mgr.device:
-            slot.conn_mgr.send_rumble(False)
+        self._set_rumble_hardware(slot_index, False)
 
     def disconnect_controller(self, slot_index: int):
         """Disconnect from controller on a specific slot."""
@@ -571,7 +566,8 @@ class GCControllerEnabler:
         self._stop_trigger_cal_live(slot_index)
         slot.cal_mgr.trigger_cal_cancel()
         self._show_cal_cancel(slot_index, False)
-        sui.cal_wizard_btn.configure(text=t("ui.cal_wizard"))
+        sui.cal_sticks_btn.configure(text=t("ui.cal_sticks"), state='normal')
+        sui.cal_triggers_btn.configure(text=t("ui.cal_triggers"), state='normal')
 
         # If BLE-connected, use BLE disconnect path
         if slot.ble_connected:
@@ -2363,25 +2359,89 @@ class GCControllerEnabler:
                 self._start_xbox360_emulation(slot_index)
 
     def _make_rumble_callback(self, slot_index: int):
-        """Create a rumble callback closure for a specific slot."""
+        """Create a rumble callback closure for a specific slot.
+
+        Hardware rumble is binary (ON/OFF). Host motor magnitudes and the
+        Settings rumble-intensity slider are combined into a 0–1 desired
+        level, then approximated with a short PWM duty cycle.
+        """
         def _on_rumble(large_motor: int, small_motor: int):
             slot = self.slots[slot_index]
-            new_state = (large_motor > 0 or small_motor > 0)
-            if new_state == slot.rumble_state:
-                return  # No change, skip
-            slot.rumble_state = new_state
-            packet = build_rumble_packet(new_state, slot.rumble_tid)
-            slot.rumble_tid = (slot.rumble_tid + 1) & 0x0F
-
-            if slot.ble_connected:
-                self._send_ble_cmd({
-                    "cmd": "rumble",
-                    "slot_index": slot_index,
-                    "data": base64.b64encode(packet).decode('ascii'),
-                })
-            elif slot.conn_mgr.device:
-                slot.conn_mgr.send_rumble(new_state)
+            intensity = float(self.slot_calibrations[0].get('rumble_intensity', 1.0))
+            host_level = max(large_motor, small_motor) / 255.0
+            desired = max(0.0, min(1.0, host_level * intensity))
+            if abs(desired - slot.rumble_desired) < 0.02 and (
+                    (desired > 0) == (slot.rumble_desired > 0)):
+                return
+            slot.rumble_desired = desired
+            # Schedule PWM update on the Tk main thread
+            self.root.after(0, lambda si=slot_index: self._sync_rumble_output(si))
         return _on_rumble
+
+    def _set_rumble_hardware(self, slot_index: int, on: bool):
+        """Send a binary rumble ON/OFF command to the connected controller."""
+        slot = self.slots[slot_index]
+        if on == slot.rumble_state:
+            return
+        slot.rumble_state = on
+        packet = build_rumble_packet(on, slot.rumble_tid)
+        slot.rumble_tid = (slot.rumble_tid + 1) & 0x0F
+
+        if slot.ble_connected:
+            self._send_ble_cmd({
+                "cmd": "rumble",
+                "slot_index": slot_index,
+                "data": base64.b64encode(packet).decode('ascii'),
+            })
+        elif slot.conn_mgr.device:
+            slot.conn_mgr.send_rumble(on)
+
+    def _stop_rumble_pwm(self, slot_index: int):
+        """Cancel any in-progress rumble PWM timer for a slot."""
+        timer_id = self._rumble_pwm_timers.pop(slot_index, None)
+        if timer_id is not None:
+            try:
+                self.root.after_cancel(timer_id)
+            except Exception:
+                pass
+
+    def _sync_rumble_output(self, slot_index: int):
+        """Apply current desired rumble level (continuous or PWM)."""
+        slot = self.slots[slot_index]
+        desired = slot.rumble_desired
+        self._stop_rumble_pwm(slot_index)
+
+        if desired <= 0.01:
+            self._set_rumble_hardware(slot_index, False)
+            return
+
+        if desired >= 0.99:
+            self._set_rumble_hardware(slot_index, True)
+            return
+
+        # Soft PWM: on for duty*period, off for the remainder, then repeat
+        period_ms = 50
+        on_ms = max(5, int(period_ms * desired))
+        off_ms = max(5, period_ms - on_ms)
+
+        def _pwm_on():
+            if self.slots[slot_index].rumble_desired <= 0.01:
+                self._set_rumble_hardware(slot_index, False)
+                return
+            self._set_rumble_hardware(slot_index, True)
+            self._rumble_pwm_timers[slot_index] = self.root.after(on_ms, _pwm_off)
+
+        def _pwm_off():
+            if self.slots[slot_index].rumble_desired <= 0.01:
+                self._set_rumble_hardware(slot_index, False)
+                return
+            if self.slots[slot_index].rumble_desired >= 0.99:
+                self._set_rumble_hardware(slot_index, True)
+                return
+            self._set_rumble_hardware(slot_index, False)
+            self._rumble_pwm_timers[slot_index] = self.root.after(off_ms, _pwm_on)
+
+        _pwm_on()
 
     def test_rumble(self, slot_index: int):
         """Send a short rumble burst (~500ms) to test the motor."""
@@ -2392,34 +2452,17 @@ class GCControllerEnabler:
         if not (slot.ble_connected or slot.conn_mgr.device):
             return
 
-        # Send rumble ON (update state so dedup in game callback stays in sync)
-        slot.rumble_state = True
-        packet_on = build_rumble_packet(True, slot.rumble_tid)
-        slot.rumble_tid = (slot.rumble_tid + 1) & 0x0F
+        intensity = float(self.slot_calibrations[0].get('rumble_intensity', 1.0))
+        if intensity <= 0.01:
+            return
 
-        if slot.ble_connected:
-            self._send_ble_cmd({
-                "cmd": "rumble",
-                "slot_index": slot_index,
-                "data": base64.b64encode(packet_on).decode('ascii'),
-            })
-        elif slot.conn_mgr.device:
-            slot.conn_mgr.send_rumble(True)
+        # Drive through the same intensity/PWM path as game rumble
+        slot.rumble_desired = intensity
+        self._sync_rumble_output(slot_index)
 
-        # Schedule rumble OFF after 500ms
         def _stop_rumble():
-            slot.rumble_state = False
-            packet_off = build_rumble_packet(False, slot.rumble_tid)
-            slot.rumble_tid = (slot.rumble_tid + 1) & 0x0F
-
-            if slot.ble_connected:
-                self._send_ble_cmd({
-                    "cmd": "rumble",
-                    "slot_index": slot_index,
-                    "data": base64.b64encode(packet_off).decode('ascii'),
-                })
-            elif slot.conn_mgr.device:
-                slot.conn_mgr.send_rumble(False)
+            slot.rumble_desired = 0.0
+            self._sync_rumble_output(slot_index)
 
         self.root.after(500, _stop_rumble)
 
@@ -2497,7 +2540,7 @@ class GCControllerEnabler:
         return self.slot_calibrations[slot_index].get('stick_left_octagon') is None
 
     def _start_auto_calibration(self, slot_index: int):
-        """Start the calibration wizard automatically for a newly connected controller."""
+        """Start stick calibration automatically for a newly connected controller."""
         if not self.slots[slot_index].is_connected:
             return
         # Wait until the controller is actually producing HID data before starting
@@ -2505,58 +2548,67 @@ class GCControllerEnabler:
             self.root.after(500, lambda si=slot_index: self._start_auto_calibration(si))
             return
         self.ui.update_status(slot_index, t("ui.auto_cal_starting"))
-        self.calibration_wizard_step(slot_index)
+        self.calibration_sticks_step(slot_index)
 
-    def calibration_wizard_step(self, slot_index: int):
-        """Unified calibration wizard: sticks first, then triggers, one button."""
+    def calibration_sticks_step(self, slot_index: int):
+        """Stick-only calibration: start on first click, finish on second."""
         slot = self.slots[slot_index]
         sui = self.ui.slots[slot_index]
-        logger.debug("Slot %d: calibration_wizard_step (stick_cal=%s, trigger_step=%d)",
-                      slot_index, slot.cal_mgr.stick_calibrating, slot.cal_mgr.trigger_cal_step)
+        logger.debug("Slot %d: calibration_sticks_step (stick_cal=%s)",
+                      slot_index, slot.cal_mgr.stick_calibrating)
+
+        # Don't interrupt an in-progress trigger calibration
+        if slot.cal_mgr.trigger_cal_step > 0:
+            return
 
         if slot.cal_mgr.stick_calibrating:
             slot.cal_mgr.finish_stick_calibration()
             self.ui.set_calibration_mode(slot_index, False)
             self.ui.redraw_octagons(slot_index)
             self._auto_save()
+            self._show_cal_cancel(slot_index, False)
+            sui.cal_sticks_btn.configure(text=t("ui.cal_sticks"), state='normal')
+            sui.cal_triggers_btn.configure(state='normal')
+            self.ui.update_status(slot_index, t("ui.ready"))
+            return
 
-            result = slot.cal_mgr.trigger_cal_next_step()
-            if result:
-                _step, _btn, status_text = result
-                sui.cal_wizard_btn.configure(text=t("btn.continue"))
-                self.ui.update_status(slot_index, status_text)
-                self._show_cal_cancel(slot_index, True)
-                self._start_trigger_cal_live(slot_index)
+        self.ui.set_calibration_mode(slot_index, True)
+        slot.cal_mgr.start_stick_calibration()
+        sui.cal_sticks_btn.configure(text=t("btn.continue"))
+        sui.cal_triggers_btn.configure(state='disabled')
+        self._show_cal_cancel(slot_index, True)
+        self.ui.update_status(slot_index, t("cal.sticks_instruction"))
 
-        elif slot.cal_mgr.trigger_cal_step > 0:
-            result = slot.cal_mgr.trigger_cal_next_step()
-            if result:
-                step, btn_text, status_text = result
-                self.ui.update_status(slot_index, status_text)
-                if step == 0:
-                    self._stop_trigger_cal_live(slot_index)
-                    self._show_cal_cancel(slot_index, False)
-                    sui.cal_wizard_btn.configure(text=t("ui.cal_wizard"))
-                    self.ui.draw_trigger_markers(slot_index)
-                    self._auto_save()
-                else:
-                    sui.cal_wizard_btn.configure(text=btn_text)
+    def calibration_triggers_step(self, slot_index: int):
+        """Trigger-only calibration wizard (independent of sticks)."""
+        slot = self.slots[slot_index]
+        sui = self.ui.slots[slot_index]
+        logger.debug("Slot %d: calibration_triggers_step (trigger_step=%d)",
+                      slot_index, slot.cal_mgr.trigger_cal_step)
 
+        # Don't interrupt an in-progress stick calibration
+        if slot.cal_mgr.stick_calibrating:
+            return
+
+        result = slot.cal_mgr.trigger_cal_next_step()
+        if not result:
+            return
+        step, btn_text, status_text = result
+        self.ui.update_status(slot_index, status_text)
+
+        if step == 0:
+            # Wizard finished (or cancelled via completion)
+            self._stop_trigger_cal_live(slot_index)
+            self._show_cal_cancel(slot_index, False)
+            sui.cal_triggers_btn.configure(text=t("ui.cal_triggers"), state='normal')
+            sui.cal_sticks_btn.configure(state='normal')
+            self.ui.draw_trigger_markers(slot_index)
+            self._auto_save()
         else:
-            if self._needs_calibration(slot_index):
-                self.ui.set_calibration_mode(slot_index, True)
-                slot.cal_mgr.start_stick_calibration()
-                sui.cal_wizard_btn.configure(text=t("btn.continue"))
-                self._show_cal_cancel(slot_index, True)
-                self.ui.update_status(slot_index, t("cal.sticks_instruction"))
-            else:
-                result = slot.cal_mgr.trigger_cal_next_step()
-                if result:
-                    _step, _btn, status_text = result
-                    sui.cal_wizard_btn.configure(text=t("btn.continue"))
-                    self.ui.update_status(slot_index, status_text)
-                    self._show_cal_cancel(slot_index, True)
-                    self._start_trigger_cal_live(slot_index)
+            sui.cal_triggers_btn.configure(text=btn_text)
+            sui.cal_sticks_btn.configure(state='disabled')
+            self._show_cal_cancel(slot_index, True)
+            self._start_trigger_cal_live(slot_index)
 
     def cancel_calibration(self, slot_index: int):
         """Cancel any in-progress calibration (sticks or triggers)."""
@@ -2575,7 +2627,8 @@ class GCControllerEnabler:
             self.ui.draw_trigger_markers(slot_index)
 
         self._show_cal_cancel(slot_index, False)
-        sui.cal_wizard_btn.configure(text=t("ui.cal_wizard"))
+        sui.cal_sticks_btn.configure(text=t("ui.cal_sticks"), state='normal')
+        sui.cal_triggers_btn.configure(text=t("ui.cal_triggers"), state='normal')
         self.ui.update_status(slot_index, t("ui.ready"))
 
     def _show_cal_cancel(self, slot_index: int, show: bool):
@@ -2638,6 +2691,8 @@ class GCControllerEnabler:
         self.slot_calibrations[0]['trigger_bump_100_percent'] = self.ui.trigger_mode_var.get()
         self.slot_calibrations[0]['minimize_to_tray'] = self.ui.minimize_to_tray_var.get()
         self.slot_calibrations[0]['stick_deadzone'] = self.ui.stick_deadzone_var.get()
+        self.slot_calibrations[0]['map_home_to_guide'] = self.ui.map_home_to_guide_var.get()
+        self.slot_calibrations[0]['rumble_intensity'] = self.ui.rumble_intensity_var.get()
         self.slot_calibrations[0]['run_at_startup'] = self.ui.run_at_startup_var.get()
 
         from . import autostart
@@ -2651,6 +2706,8 @@ class GCControllerEnabler:
             cal['trigger_bump_100_percent'] = self.ui.trigger_mode_var.get()
             cal['emulation_mode'] = self.ui.emu_mode_var.get()
             cal['stick_deadzone'] = self.ui.stick_deadzone_var.get()
+            cal['map_home_to_guide'] = self.ui.map_home_to_guide_var.get()
+            cal['rumble_intensity'] = self.ui.rumble_intensity_var.get()
             self.slots[i].cal_mgr.refresh_cache()
 
             # Save per-device calibration back to the BLE device registry

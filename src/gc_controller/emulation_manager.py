@@ -79,7 +79,14 @@ class EmulationManager:
             right_trigger_calibrated = self._cal_mgr.calibrate_trigger_fast(right_trigger, 'right')
 
             # Only emit press/release on state changes (delta updates)
+            map_home = self._cal_mgr._calibration.get('map_home_to_guide', True)
             for button_name, xbox_button in BUTTON_MAPPING.items():
+                if button_name == 'Home' and not map_home:
+                    # Ensure Guide is released if mapping was just disabled
+                    if self._prev_buttons.get('Home', False):
+                        self.gamepad.release_button(xbox_button)
+                        self._prev_buttons['Home'] = False
+                    continue
                 pressed = button_states.get(button_name, False)
                 if pressed != self._prev_buttons.get(button_name, False):
                     if pressed:

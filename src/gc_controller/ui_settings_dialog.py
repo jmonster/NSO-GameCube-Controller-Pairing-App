@@ -35,6 +35,8 @@ class SettingsDialog:
                  auto_connect_var: tk.BooleanVar,
                  minimize_to_tray_var: tk.BooleanVar,
                  stick_deadzone_var: tk.DoubleVar = None,
+                 map_home_to_guide_var: tk.BooleanVar = None,
+                 rumble_intensity_var: tk.DoubleVar = None,
                  auto_scan_ble_var: tk.BooleanVar = None,
                  run_at_startup_var: tk.BooleanVar = None,
                  on_emulate_all: Callable = lambda: None,
@@ -52,6 +54,8 @@ class SettingsDialog:
         self._auto_connect_var = auto_connect_var
         self._minimize_to_tray_var = minimize_to_tray_var
         self._stick_deadzone_var = stick_deadzone_var
+        self._map_home_to_guide_var = map_home_to_guide_var
+        self._rumble_intensity_var = rumble_intensity_var
         self._auto_scan_ble_var = auto_scan_ble_var
         self._run_at_startup_var = run_at_startup_var
         self._on_emulate_all = on_emulate_all
@@ -176,6 +180,51 @@ class SettingsDialog:
                 width=160,
             )
             self._dz_slider.pack(side=tk.LEFT)
+
+        # ── Rumble Intensity ──
+        if self._rumble_intensity_var is not None:
+            customtkinter.CTkLabel(
+                left, text=t("settings.rumble_intensity"),
+                text_color=T.TEXT_PRIMARY, font=(T.FONT_FAMILY, 16, "bold"),
+            ).pack(anchor=tk.W, pady=(12, 4))
+
+            rumble_row = customtkinter.CTkFrame(left, fg_color="transparent")
+            rumble_row.pack(anchor=tk.W, fill=tk.X, padx=16)
+
+            self._rumble_label = customtkinter.CTkLabel(
+                rumble_row,
+                text=f"{self._rumble_intensity_var.get():.0%}",
+                text_color=T.TEXT_PRIMARY,
+                font=(T.FONT_FAMILY, 13),
+                width=40,
+            )
+            self._rumble_label.pack(side=tk.RIGHT, padx=(4, 0))
+
+            self._rumble_slider = customtkinter.CTkSlider(
+                rumble_row,
+                from_=0.0, to=1.0, number_of_steps=20,
+                variable=self._rumble_intensity_var,
+                command=self._on_rumble_intensity_changed,
+                fg_color=T.SURFACE_DARK,
+                progress_color=T.GC_PURPLE_LIGHT,
+                button_color=T.BTN_FG,
+                button_hover_color=T.BTN_HOVER,
+                width=160,
+            )
+            self._rumble_slider.pack(side=tk.LEFT)
+
+        # ── Map Home to Guide ──
+        if self._map_home_to_guide_var is not None:
+            customtkinter.CTkCheckBox(
+                left, text=t("settings.map_home_to_guide"),
+                variable=self._map_home_to_guide_var,
+                fg_color=T.RADIO_FG,
+                hover_color=T.RADIO_HOVER,
+                checkmark_color=T.BTN_TEXT,
+                border_color=T.RADIO_BORDER,
+                text_color=T.TEXT_PRIMARY,
+                font=(T.FONT_FAMILY, 14),
+            ).pack(anchor=tk.W, pady=(12, 4))
 
         # ── Auto-connect ──
         customtkinter.CTkCheckBox(
@@ -477,6 +526,10 @@ class SettingsDialog:
     def _on_deadzone_changed(self, value):
         """Update the deadzone label when the slider moves."""
         self._dz_label.configure(text=f"{value:.0%}")
+
+    def _on_rumble_intensity_changed(self, value):
+        """Update the rumble intensity label when the slider moves."""
+        self._rumble_label.configure(text=f"{value:.0%}")
 
     def _on_save_click(self):
         if self._on_save:
