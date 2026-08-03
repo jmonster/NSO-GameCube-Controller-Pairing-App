@@ -51,9 +51,10 @@ from .settings_manager import SettingsManager
 # below 100% are approximated by pulsing.
 _RUMBLE_REFRESH_MS = 45       # re-send interval that keeps the motor running
 _RUMBLE_MIN_PULSE_MS = 12     # shortest pulse Tk timers can deliver reliably
-_RUMBLE_MAX_PERIOD_MS = 400   # longest gap between pulses at the weakest setting
+_RUMBLE_MAX_PERIOD_MS = 700   # weakest setting: one short tap per rumble event
 _RUMBLE_CURVE = 1.8           # >1 makes the lower half of the slider much softer
 _RUMBLE_MIN_DUTY = _RUMBLE_MIN_PULSE_MS / _RUMBLE_MAX_PERIOD_MS
+_RUMBLE_OFF_REPEAT_MS = 25    # repeat of the stop packet, in case one is dropped
 
 
 def setup_logging(debug: bool = False):
@@ -2458,6 +2459,14 @@ class GCControllerEnabler:
 
         def _pulse_off(si=slot_index, gap=off_ms):
             self._set_rumble_hardware(si, False)
+            # Rumble writes go out without response and can be dropped. A lost
+            # stop leaves the motor running the rest of its burst, which turns
+            # a soft tap into a much harder one, so repeat it when there is
+            # room in the gap.
+            if gap >= 2 * _RUMBLE_OFF_REPEAT_MS:
+                self.root.after(
+                    _RUMBLE_OFF_REPEAT_MS,
+                    lambda: self._set_rumble_hardware(si, False, force=True))
             if self.slots[si].rumble_desired <= 0.001:
                 self._rumble_pwm_timers.pop(si, None)
                 return
