@@ -219,6 +219,7 @@ class GCControllerEnabler:
         self._ble_available = is_ble_available()
         self._ble_subprocess = None
         self._ble_reader_thread = None
+        self._ble_stderr_thread = None
         self._ble_initialized = False
         self._ble_init_event = threading.Event()
         self._ble_init_result = None
@@ -607,7 +608,7 @@ class GCControllerEnabler:
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
         else:
             if frozen:
@@ -621,12 +622,15 @@ class GCControllerEnabler:
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
 
         self._ble_reader_thread = threading.Thread(
             target=self._ble_event_reader, daemon=True)
         self._ble_reader_thread.start()
+        self._ble_stderr_thread = threading.Thread(
+            target=self._ble_stderr_reader, daemon=True)
+        self._ble_stderr_thread.start()
 
     def _send_ble_cmd(self, cmd: dict):
         """Send a JSON-line command to the BLE subprocess."""
@@ -713,6 +717,19 @@ class GCControllerEnabler:
 
                 self.root.after(
                     0, lambda ev=event: self._handle_ble_event(ev))
+        except Exception:
+            pass
+
+    def _ble_stderr_reader(self):
+        """Forward BLE subprocess stderr into the app logger."""
+        proc = self._ble_subprocess
+        if not proc or not proc.stderr:
+            return
+        try:
+            for raw_line in iter(proc.stderr.readline, b''):
+                line = raw_line.decode('utf-8', errors='replace').rstrip()
+                if line:
+                    logger.debug("BLE subprocess: %s", line)
         except Exception:
             pass
 
@@ -2710,10 +2727,11 @@ class GCControllerEnabler:
         png_path = os.path.join(base, "controller.png")
 
         try:
-            image = PILImage.open(png_path)
+            with PILImage.open(png_path) as loaded_image:
+                image = loaded_image.convert('RGBA').copy()
         except Exception:
             # Fallback: create a simple colored icon
-            image = PILImage.new('RGB', (64, 64), color=(83, 84, 134))
+            image = PILImage.new('RGBA', (64, 64), color=(83, 84, 134, 255))
 
         menu = pystray.Menu(
             pystray.MenuItem(t("tray.show"), self._tray_show, default=True),
