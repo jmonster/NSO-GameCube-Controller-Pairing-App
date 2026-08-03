@@ -61,7 +61,7 @@ pip install -r requirements.txt
 2. Platform-specific setup:
 
 ### Windows
-- Install the [ViGEmBus driver](https://github.com/nefarius/ViGEmBus/releases) for Xbox 360 emulation — download the latest `ViGEmBus_Setup_x64.msi` from the releases page, run the installer, and reboot
+- Install the ViGEmBus driver for Xbox 360 emulation — a final archived copy is bundled in [`platform/windows/vendor/ViGEmBus/`](platform/windows/vendor/ViGEmBus/) (`ViGEmBus_1.22.0_x64_x86_arm64.exe`). Run it as Administrator and reboot. Upstream ViGEmBus is archived; prefer the bundled installer if the original releases page is unavailable.
 - **For Bluetooth**: install the [Bleak](https://github.com/hbldh/bleak) BLE library (`pip install bleak`). No elevated privileges needed — Windows BLE runs in userspace via WinRT.
 
 
@@ -210,6 +210,7 @@ platform/
   windows/
     build.bat               Windows build script
     hook-vgamepad.py        PyInstaller hook for vgamepad
+    vendor/ViGEmBus/        Bundled final ViGEmBus 1.22.0 installer (archived upstream)
 ```
 
 ## Advanced: Reducing Input Latency
@@ -288,7 +289,7 @@ For the best wireless experience:
 - Verify Vendor ID `0x057e` and Product ID `0x2073` (check `lsusb` on Linux or Device Manager on Windows)
 
 ### Emulation Not Working
-- **Windows**: install [ViGEmBus](https://github.com/nefarius/ViGEmBus) and `pip install vgamepad`
+- **Windows**: install ViGEmBus (bundled installer in `platform/windows/vendor/ViGEmBus/`) and `pip install vgamepad`
 - **Linux**: install evdev (`pip install evdev`), ensure your user is in the `input` group, and install the udev rules
 - **macOS**: Xbox 360 emulation is not supported; use Dolphin pipe mode
 
