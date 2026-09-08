@@ -114,6 +114,7 @@ from .emulation_manager import EmulationManager
 from .input_processor import InputProcessor
 from .controller_slot import ControllerSlot, normalize_ble_address
 from .ble.sw2_protocol import build_rumble_packet
+from .ui_dispatch import MainThreadDispatcher
 
 # System tray support (optional).
 # On macOS, pystray runs [NSApplication run] from a background thread which
@@ -168,6 +169,7 @@ class GCControllerEnabler:
         self.root.configure(fg_color="#535486")
         self.root.minsize(720, 540)
         self._set_window_icon()
+        self._ui_dispatcher = MainThreadDispatcher(self.root)
 
         # Per-slot calibration dicts
         self.slot_calibrations = [dict(DEFAULT_CALIBRATION) for _ in range(MAX_SLOTS)]
@@ -208,10 +210,10 @@ class GCControllerEnabler:
                 on_status=lambda msg, idx=i: self._schedule_status(idx, msg),
                 on_progress=lambda val, idx=i: self._schedule_progress(idx, val),
                 on_ui_update=lambda *args, idx=i: self._schedule_ui_update(idx, *args),
-                on_error=lambda msg, idx=i: self.root.after(
-                    0, lambda m=msg: self.ui.update_status(idx, m)),
-                on_disconnect=lambda idx=i: self.root.after(
-                    0, lambda: self._on_unexpected_disconnect(idx)),
+                on_error=lambda msg, idx=i: self._call_on_ui_thread(
+                    self.ui.update_status, idx, msg),
+                on_disconnect=lambda idx=i: self._call_on_ui_thread(
+                    self._on_unexpected_disconnect, idx),
             )
             self.slots.append(slot)
 
@@ -717,8 +719,7 @@ class GCControllerEnabler:
                     self._ble_init_event.set()
                     continue
 
-                self.root.after(
-                    0, lambda ev=event: self._handle_ble_event(ev))
+                self._call_on_ui_thread(self._handle_ble_event, event)
         except Exception:
             pass
 
@@ -876,9 +877,9 @@ class GCControllerEnabler:
         def _bg_init():
             try:
                 success = self._init_ble_background()
-                self.root.after(0, lambda: self._on_ble_init_complete(success))
+                self._call_on_ui_thread(self._on_ble_init_complete, success)
             except Exception:
-                self.root.after(0, lambda: self._on_ble_init_complete(False))
+                self._call_on_ui_thread(self._on_ble_init_complete, False)
 
         threading.Thread(target=_bg_init, daemon=True).start()
 
@@ -1230,7 +1231,7 @@ class GCControllerEnabler:
             # Disconnect if this device is currently connected on any slot
             for slot in self.slots:
                 if slot.ble_address and slot.ble_address.upper() == addr_upper:
-                    self.root.after(0, lambda s=slot: self.disconnect_controller(s.index))
+                    self._call_on_ui_thread(self.disconnect_controller, slot.index)
             # Stop auto-scan if no known devices remain
             if not devices:
                 self._stop_auto_scan()
@@ -2364,7 +2365,7 @@ class GCControllerEnabler:
                 return
             slot.rumble_desired = desired
             # Drive the motor from the Tk main thread
-            self.root.after(0, lambda si=slot_index: self._sync_rumble_output(si))
+            self._call_on_ui_thread(self._sync_rumble_output, slot_index)
         return _on_rumble
 
     def _set_rumble_hardware(self, slot_index: int, on: bool, force: bool = False):
@@ -2519,9 +2520,9 @@ class GCControllerEnabler:
             try:
                 slot.emu_mgr.start('dolphin_pipe', slot_index=slot_index,
                                    cancel_event=cancel)
-                self.root.after(0, lambda: self._on_pipe_connected(slot_index))
+                self._call_on_ui_thread(self._on_pipe_connected, slot_index)
             except Exception as e:
-                self.root.after(0, lambda err=e: self._on_pipe_failed(slot_index, err))
+                self._call_on_ui_thread(self._on_pipe_failed, slot_index, e)
 
         threading.Thread(target=_connect, daemon=True).start()
 
@@ -2745,9 +2746,13 @@ class GCControllerEnabler:
 
     # ── Thread-safe bridges ──────────────────────────────────────────
 
+    def _call_on_ui_thread(self, callback, *args, **kwargs):
+        """Enqueue worker callbacks without entering Tcl from their thread."""
+        return self._ui_dispatcher.post(callback, *args, **kwargs)
+
     def _schedule_status(self, slot_index: int, message: str):
-        """Thread-safe status update via root.after."""
-        self.root.after(0, lambda: self.ui.update_status(slot_index, message))
+        """Thread-safe status update."""
+        self._call_on_ui_thread(self.ui.update_status, slot_index, message)
 
     def _schedule_progress(self, slot_index: int, value: int):
         """No-op — progress bar replaced by log text area."""
@@ -2884,7 +2889,7 @@ class GCControllerEnabler:
         if self._tray_icon:
             self._tray_icon.visible = False
         # Schedule on the Tkinter main thread
-        self.root.after(0, self._restore_window)
+        self._call_on_ui_thread(self._restore_window)
 
     def _restore_window(self):
         """Restore and focus the main window."""
@@ -2897,7 +2902,7 @@ class GCControllerEnabler:
         if self._tray_icon:
             self._tray_icon.visible = False
         # Schedule actual closing on the Tkinter main thread
-        self.root.after(0, self._actual_quit)
+        self._call_on_ui_thread(self._actual_quit)
 
     # ── Lifecycle ────────────────────────────────────────────────────
 
@@ -2913,6 +2918,7 @@ class GCControllerEnabler:
 
     def _actual_quit(self):
         """Perform full application shutdown and destroy the window."""
+        self._ui_dispatcher.close()
         # Stop USB hotplug polling
         self._stop_usb_hotplug()
 
