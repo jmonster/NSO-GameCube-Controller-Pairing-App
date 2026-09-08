@@ -29,34 +29,80 @@ class EmulationManager:
         self.mode: str = 'xbox360'
         self._prev_buttons: Dict[str, bool] = {}
         self._output_lock = threading.RLock()
+        self._pending = None
+        self._generation = 0
 
     def start(self, mode: str = 'xbox360', slot_index: int = 0,
               cancel_event: threading.Event | None = None,
               rumble_callback=None) -> None:
         """Create the virtual gamepad and begin emulation. Raises on failure."""
-        self.mode = mode
-        self._prev_buttons = {}
-        logger.info("Starting emulation: mode=%s slot=%d", mode, slot_index)
-        self.gamepad = create_gamepad(mode, slot_index=slot_index,
-                                     cancel_event=cancel_event)
-        if rumble_callback and mode in ('xbox360', 'dsu'):
-            self.gamepad.set_rumble_callback(rumble_callback)
-        self.is_emulating = True
+        cancel = cancel_event if cancel_event is not None else threading.Event()
+        with self._output_lock:
+            if cancel.is_set():
+                raise OSError(errno.ECANCELED, 'Emulation start was cancelled')
+            if self.gamepad is not None or self._pending is not None:
+                raise OSError(errno.EBUSY, 'Emulation is active or still finishing a start')
+            self._generation += 1
+            generation = self._generation
+            self._pending = cancel
+
+        # Never hold the output lock across a blocking factory. Stop must be
+        # able to cancel it even before Dolphin opens the FIFO reader.
+        pad = None
+        try:
+            logger.info("Starting emulation: mode=%s slot=%d", mode, slot_index)
+            pad = create_gamepad(mode, slot_index=slot_index, cancel_event=cancel)
+            if rumble_callback and mode in ('xbox360', 'dsu'):
+                def owned_rumble(*args, _pad=pad):
+                    if (self.gamepad is _pad and self.is_emulating and
+                            self._generation == generation):
+                        rumble_callback(*args)
+                pad.set_rumble_callback(owned_rumble)
+            with self._output_lock:
+                if cancel.is_set() or self._generation != generation:
+                    raise OSError(errno.ECANCELED, 'Emulation start was cancelled')
+                self.mode = mode
+                self._prev_buttons = {}
+                self.gamepad = pad
+                self.is_emulating = True
+                pad = None  # Ownership transferred; finally must not close it.
+        finally:
+            # A failed/cancelled factory result must never leak a virtual device.
+            # Keep the pending reservation until disposal has finished so a new
+            # factory cannot reuse its slot while the old result is closing.
+            try:
+                if pad is not None:
+                    self._dispose(pad)
+            finally:
+                with self._output_lock:
+                    if self._pending is cancel:
+                        self._pending = None
+
+    @property
+    def is_starting(self) -> bool:
+        with self._output_lock:
+            return self._pending is not None
+
+    @staticmethod
+    def _dispose(pad):
+        for operation in (pad.stop_rumble_listener, pad.reset, pad.update, pad.close):
+            try:
+                operation()
+            except Exception:
+                logger.debug("Output teardown operation failed", exc_info=True)
 
     def stop(self) -> None:
-        """Serialize teardown with updates and send a neutral state before close."""
+        """Cancel creation, then serialize neutralization against input updates."""
         with self._output_lock:
+            self._generation += 1
+            if self._pending is not None:
+                self._pending.set()
             logger.info("Stopping emulation (mode=%s)", self.mode)
             self.is_emulating = False
             self._prev_buttons = {}
             pad, self.gamepad = self.gamepad, None
-            if pad is None:
-                return
-            for operation in (pad.stop_rumble_listener, pad.reset, pad.update, pad.close):
-                try:
-                    operation()
-                except Exception:
-                    logger.debug("Output teardown operation failed", exc_info=True)
+            if pad is not None:
+                self._dispose(pad)
 
     def update(self, left_x, left_y, right_x, right_y,
                left_trigger, right_trigger, button_states: Dict[str, bool]):

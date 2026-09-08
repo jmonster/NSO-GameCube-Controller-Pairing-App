@@ -126,6 +126,7 @@ class ParentOwnershipTests(unittest.TestCase):
         obj = self.gui(b'')
         ble = types.SimpleNamespace(ble_connected=True, connection_mode='ble',
                                     input_proc=Mock(), emu_mgr=Mock(), ble_data_queue=queue.Queue())
+        ble.stop_emulation = ble.emu_mgr.stop
         ble.ble_data_queue.put(b'stale')
         usb = types.SimpleNamespace(ble_connected=False, connection_mode='usb',
                                     input_proc=Mock(), emu_mgr=Mock())

@@ -569,7 +569,7 @@ class GCControllerEnabler:
 
         self._reset_rumble(slot_index)
         slot.input_proc.stop()
-        slot.emu_mgr.stop()
+        slot.stop_emulation()
         slot.conn_mgr.disconnect()
         slot.device_path = None
         slot.device_identity = None
@@ -728,7 +728,7 @@ class GCControllerEnabler:
             if slot.ble_connected:
                 self._reset_rumble(si)
                 slot.input_proc.stop()
-                slot.emu_mgr.stop()
+                slot.stop_emulation()
                 slot.ble_connected = False
                 while not slot.ble_data_queue.empty():
                     try:
@@ -1643,7 +1643,7 @@ class GCControllerEnabler:
         # already stopped by an earlier unexpected disconnect).  This tells
         # any pending _attempt_ble_reconnect loop to abort.
         slot.input_proc.stop_event.set()
-        slot.emu_mgr.stop()
+        slot.stop_emulation()
 
         if slot.ble_address and self._ble_subprocess:
             self._send_ble_cmd({
@@ -1690,8 +1690,7 @@ class GCControllerEnabler:
         # for a user-initiated disconnect (stop() sets it, but here the
         # disconnect is unexpected — we WANT to reconnect).
         slot.input_proc.stop_event.clear()
-        if slot.emu_mgr.is_emulating:
-            slot.emu_mgr.stop()
+        slot.stop_emulation()
 
         slot.ble_connected = False
 
@@ -2156,8 +2155,7 @@ class GCControllerEnabler:
 
         was_emulating = usb_slot_obj.emu_mgr.is_emulating
         usb_slot_obj.input_proc.stop()
-        if usb_slot_obj.emu_mgr.is_emulating:
-            usb_slot_obj.emu_mgr.stop()
+        usb_slot_obj.stop_emulation()
         saved_path = usb_slot_obj.device_path
         saved_hid = usb_slot_obj.conn_mgr.device
 
@@ -2219,8 +2217,7 @@ class GCControllerEnabler:
 
         slot.reconnect_was_emulating = slot.emu_mgr.is_emulating
 
-        if slot.emu_mgr.is_emulating:
-            slot.emu_mgr.stop()
+        slot.stop_emulation()
 
         self.ui.update_status(slot_index, t("ui.disconnected_reconnecting"))
         sui.connect_btn.configure(text=t("ui.connect_usb"))
@@ -2314,7 +2311,8 @@ class GCControllerEnabler:
 
     def toggle_emulation_all(self):
         """Start or stop emulation on all connected controllers."""
-        any_emulating = any(s.emu_mgr.is_emulating for s in self.slots)
+        any_emulating = any(s.emu_mgr.is_emulating or getattr(s, '_pipe_cancel', None)
+                            for s in self.slots)
         for i, slot in enumerate(self.slots):
             if any_emulating:
                 # Stop all emulating slots
@@ -2344,11 +2342,7 @@ class GCControllerEnabler:
 
         if slot.emu_mgr.is_emulating or getattr(slot, '_pipe_cancel', None):
             # Cancel a pending dolphin pipe wait, or stop active emulation.
-            cancel = getattr(slot, '_pipe_cancel', None)
-            if cancel is not None:
-                cancel.set()
-                slot._pipe_cancel = None
-            slot.emu_mgr.stop()
+            slot.stop_emulation()
             self.ui.update_emu_status(slot_index, "")
             self.ui.update_tab_status(slot_index, connected=slot.is_connected, emulating=False)
         else:
@@ -2530,8 +2524,6 @@ class GCControllerEnabler:
         Polls until Dolphin opens the read end of the pipe.
         """
         slot = self.slots[slot_index]
-        pipe_name = f'gc_controller_{slot_index + 1}'
-
         cancel = threading.Event()
         slot._pipe_cancel = cancel
         self.ui.update_emu_status(
@@ -2541,25 +2533,30 @@ class GCControllerEnabler:
             try:
                 slot.emu_mgr.start('dolphin_pipe', slot_index=slot_index,
                                    cancel_event=cancel)
-                self._call_on_ui_thread(self._on_pipe_connected, slot_index)
+                self._call_on_ui_thread(self._on_pipe_connected, slot_index, slot, cancel)
             except Exception as e:
-                self._call_on_ui_thread(self._on_pipe_failed, slot_index, e)
+                self._call_on_ui_thread(self._on_pipe_failed, slot_index, slot, cancel, e)
 
         threading.Thread(target=_connect, daemon=True).start()
 
-    def _on_pipe_connected(self, slot_index: int):
-        """Called on the main thread when a dolphin pipe successfully opens."""
+    def _on_pipe_connected(self, slot_index: int, owner, cancel):
+        """Only the still-current attempt can publish its completion to Tk."""
         slot = self.slots[slot_index]
+        if (slot is not owner or slot._pipe_cancel is not cancel or
+                cancel.is_set() or not slot.emu_mgr.is_emulating):
+            return
         slot._pipe_cancel = None
         self.ui.update_emu_status(
             slot_index, t("emu.connected_ready"))
         self.ui.update_tab_status(slot_index, connected=True, emulating=True)
 
-    def _on_pipe_failed(self, slot_index: int, error: Exception):
-        """Called on the main thread when dolphin pipe open fails or is cancelled."""
+    def _on_pipe_failed(self, slot_index: int, owner, cancel, error: Exception):
+        """A retired failure must not stop a newer attempt or show a stale alert."""
         slot = self.slots[slot_index]
+        if slot is not owner or slot._pipe_cancel is not cancel or cancel.is_set():
+            return
         slot._pipe_cancel = None
-        slot.emu_mgr.stop()
+        slot.stop_emulation()
         self.ui.update_emu_status(slot_index, "")
         self.ui.update_tab_status(slot_index, connected=slot.is_connected, emulating=False)
         if getattr(error, 'errno', None) != errno.ECANCELED:
@@ -2953,7 +2950,7 @@ class GCControllerEnabler:
             self._reset_rumble(i)
             slot = self.slots[i]
             slot.input_proc.stop()
-            slot.emu_mgr.stop()
+            slot.stop_emulation()
             slot.conn_mgr.disconnect()
 
         # Clean up BLE subprocess
