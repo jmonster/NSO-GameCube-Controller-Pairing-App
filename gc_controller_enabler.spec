@@ -146,6 +146,7 @@ hiddenimports = [
     'gc_controller.virtual_gamepad',
     'gc_controller.controller_constants',
     'gc_controller.settings_manager',
+    'gc_controller.settings_schema',
     'gc_controller.settings_storage',
     'gc_controller.calibration',
     'gc_controller.connection_manager',

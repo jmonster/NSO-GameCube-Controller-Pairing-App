@@ -1,5 +1,4 @@
 """Stable settings location and failure-safe, same-directory file publication."""
-import json
 import logging
 import os
 import stat
@@ -8,7 +7,9 @@ import tempfile
 
 _logger = logging.getLogger(__name__)
 SETTINGS_NAME = 'gc_controller_settings.json'
-MAX_LEGACY_BYTES = 1024 * 1024
+from .settings_schema import MAX_SETTINGS_BYTES, decode_settings
+
+MAX_LEGACY_BYTES = MAX_SETTINGS_BYTES
 
 
 def atomic_write(path, payload, *, overwrite=True):
@@ -71,14 +72,13 @@ def get_settings_dir(*, platform=None, home=None, environ=None, frozen=None, cwd
                     raise ValueError('Legacy settings must be a bounded regular file')
                 with open(legacy, 'rb') as stream:
                     payload = stream.read(MAX_LEGACY_BYTES + 1)
-                if len(payload) > MAX_LEGACY_BYTES or not isinstance(json.loads(payload.decode('utf-8')), dict):
-                    raise ValueError('Legacy settings must contain a JSON object')
+                decode_settings(payload)  # Validate, but retain the original bytes/version.
                 atomic_write(target, payload, overwrite=False)
                 _logger.info('Migrated settings from %s to %s; original retained', legacy, target)
             except FileNotFoundError:
                 pass
             except FileExistsError:
                 pass  # Another process published settings first; never replace it.
-            except (OSError, ValueError, UnicodeError) as exc:
+            except (OSError, ValueError, UnicodeError, RecursionError) as exc:
                 _logger.warning('Legacy settings migration skipped: %s', exc)
     return directory

@@ -1,137 +1,54 @@
-"""
-Settings Manager
-
-Handles loading and saving calibration settings to a JSON file,
-including migration from v1/v2 (slot-based) to v3 (global-only) format.
-
-v4 format: adds slot_assignments (device identity -> slot index) and
-device_links (cross-transport identity pairing) on top of v3.
-"""
-
-import json
+"""Typed, atomic settings persistence with non-destructive v1-v4 migration."""
 import logging
 import os
+import stat
 import threading
 from typing import List
 
-from .controller_constants import DEFAULT_CALIBRATION, MAX_SLOTS, BLE_DEVICE_CAL_KEYS
-
+from .settings_schema import GLOBAL_KEYS, MAX_SETTINGS_BYTES, decode_settings, encode_settings
 from .settings_storage import atomic_write
 
 logger = logging.getLogger(__name__)
 
 
-# Keys stored in the global section of the config file.
-_GLOBAL_KEYS = {
-    'auto_connect', 'auto_scan_ble', 'emulation_mode', 'trigger_bump_100_percent',
-    'minimize_to_tray', 'stick_deadzone', 'map_home_to_guide', 'rumble_intensity',
-    'known_ble_devices', 'run_at_startup', 'slot_assignments', 'device_links',
-}
-
-
 class SettingsManager:
-    """Manages persistent calibration settings."""
-
     def __init__(self, slot_calibrations: List[dict], settings_dir: str):
         self._slot_calibrations = slot_calibrations
         self._settings_file = os.path.join(settings_dir, 'gc_controller_settings.json')
         self._save_lock = threading.Lock()
+        self._load_error = None
 
     def load(self):
-        """Load settings from file. Handles v1, v2, v3, and v4 formats."""
-        try:
-            if not os.path.exists(self._settings_file):
-                logger.debug("No settings file at %s", self._settings_file)
-                return
-            with open(self._settings_file, 'r', encoding='utf-8') as f:
-                saved = json.load(f)
+        """Validate the entire document before changing a single live setting.
 
-            version = saved.get('version', 1)
-            logger.info("Loading settings v%d from %s", version, self._settings_file)
-            if version >= 3:
-                self._load_v3(saved)
-            elif version >= 2:
-                self._load_v2(saved)
-            else:
-                self._load_v1(saved)
-        except Exception as e:
-            logger.warning("Failed to load settings: %s", e)
-            print(f"Failed to load settings: {e}")
-
-    def _load_v1(self, saved: dict):
-        """Migrate v1 flat settings — extract global keys only."""
-        key_migration = {
-            'left_base': 'trigger_left_base',
-            'left_bump': 'trigger_left_bump',
-            'left_max': 'trigger_left_max',
-            'right_base': 'trigger_right_base',
-            'right_bump': 'trigger_right_bump',
-            'right_max': 'trigger_right_max',
-            'bump_100_percent': 'trigger_bump_100_percent',
-        }
-        for old_key, new_key in key_migration.items():
-            if old_key in saved and new_key not in saved:
-                saved[new_key] = saved.pop(old_key)
-            elif old_key in saved:
-                del saved[old_key]
-
-        # Apply only global keys
-        for key in _GLOBAL_KEYS:
-            if key in saved:
-                self._slot_calibrations[0][key] = saved[key]
-
-    def _load_v2(self, saved: dict):
-        """Migrate v2 multi-slot format — extract global keys + build device registry."""
-        global_settings = saved.get('global', {})
-        slots_data = saved.get('slots', {})
-
-        # Migrate known_ble_addresses → known_ble_devices
-        old_known = global_settings.pop('known_ble_addresses', [])
-        known_devices = global_settings.get('known_ble_devices', {})
-
-        # Build device entries from per-slot preferred_ble_address + calibration
-        for i in range(MAX_SLOTS):
-            slot_data = slots_data.get(str(i), {})
-            addr = (slot_data.get('preferred_ble_address', '') or '').upper()
-
-            if addr and addr not in known_devices:
-                dev_cal = {}
-                for key in BLE_DEVICE_CAL_KEYS:
-                    if key in slot_data:
-                        dev_cal[key] = slot_data[key]
-                known_devices[addr] = dev_cal
-
-        # Add any addresses from old known_ble_addresses list
-        for addr in old_known:
-            addr_upper = addr.upper()
-            if addr_upper not in known_devices:
-                known_devices[addr_upper] = {}
-
-        global_settings['known_ble_devices'] = known_devices
-
-        # Apply only global keys to slot 0
-        for key in _GLOBAL_KEYS:
-            if key in global_settings:
-                self._slot_calibrations[0][key] = global_settings[key]
-
-    def _load_v3(self, saved: dict):
-        """Load v3/v4 format — global settings only.
-
-        v4 is a superset of v3 (adds slot_assignments + device_links).
-        Missing keys fall back to defaults from DEFAULT_CALIBRATION.
+        Invalid/future settings remain untouched. Autosave is blocked until a
+        subsequent explicit reload succeeds (or the user removes the file).
         """
-        global_settings = saved.get('global', {})
-        for key in _GLOBAL_KEYS:
-            if key in global_settings:
-                self._slot_calibrations[0][key] = global_settings[key]
+        with self._save_lock:
+            try:
+                try:
+                    info = os.lstat(self._settings_file)
+                except FileNotFoundError:
+                    self._load_error = None
+                    return True
+                if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SETTINGS_BYTES:
+                    raise ValueError('Settings must be a bounded regular file')
+                with open(self._settings_file, 'rb') as stream:
+                    payload = stream.read(MAX_SETTINGS_BYTES + 1)
+                global_settings = decode_settings(payload)
+                self._slot_calibrations[0].update(global_settings)
+                self._load_error = None
+                return True
+            except Exception as exc:
+                self._load_error = str(exc)
+                logger.warning('Settings ignored; original preserved and autosave blocked: %s', exc)
+                return False
 
     def save(self):
-        """Write settings in v4 format (global only). Raises on failure."""
+        """Reject unsafe values before touching the last valid settings file."""
         with self._save_lock:
-            cal = self._slot_calibrations[0]
-            global_settings = {key: cal[key] for key in _GLOBAL_KEYS if key in cal}
-            output = {'version': 4, 'global': global_settings}
-            # Serialize before touching the filesystem. A bad value, failed
-            # write, or failed replacement leaves the last valid file intact.
-            payload = json.dumps(output, indent=2, allow_nan=False).encode('utf-8')
+            if self._load_error is not None:
+                raise ValueError(f'Settings were not loaded safely; repair/reload before saving: {self._load_error}')
+            calibration = self._slot_calibrations[0]
+            payload = encode_settings({key: calibration[key] for key in GLOBAL_KEYS if key in calibration})
             atomic_write(self._settings_file, payload)

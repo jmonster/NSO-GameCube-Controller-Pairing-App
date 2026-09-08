@@ -117,7 +117,9 @@ class SettingsStorageTests(unittest.TestCase):
         manager.save()
         target = self.root / storage.SETTINGS_NAME
         saved = target.read_bytes()
-        self.assertEqual(json.loads(saved)['global'], calibration)
+        self.assertEqual(json.loads(saved)['global'],
+                         {'known_ble_devices': {'CONTROLLER-É': {}}, 'stick_deadzone': 0.1})
+        self.assertIn('controller-é', calibration['known_ble_devices'])  # Save does not mutate caller state.
         calibration['stick_deadzone'] = float('nan')
         with self.assertRaises(ValueError):
             manager.save()
