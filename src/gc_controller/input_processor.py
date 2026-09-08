@@ -58,6 +58,8 @@ def _translate_report_0x05(data) -> list:
         [13]     left trigger
         [14]     right trigger
     """
+    if len(data) < 63 or data[0] != 0x05:
+        raise ValueError("0x05 input report requires its ID and both trigger fields (63 bytes)")
     buf = [0] * 64
 
     # Buttons: remap NSO encoding -> GC encoding
@@ -98,12 +100,9 @@ def _translate_report_0x05(data) -> list:
     for i in range(6):
         buf[6 + i] = data[11 + i]
 
-    # Analog triggers: bytes 61-62 in the 0x05 report
-    if len(data) > 62:
-        buf[13] = data[61]  # left trigger analog
-        buf[14] = data[62]  # right trigger analog
-    else:
-        logger.warning("Short 0x05 report (%d bytes) — trigger data missing", len(data))
+    # Length was validated before decoding any fields.
+    buf[13] = data[61]  # left trigger analog
+    buf[14] = data[62]  # right trigger analog
 
     return buf
 
@@ -131,6 +130,8 @@ def _translate_report_0x0A(data) -> list:
     here (standard Switch) vs 0x40/0x80 in the 0x05 format (which has
     SR/SL occupying 0x10/0x20).
     """
+    if len(data) < 15 or data[0] != 0x0A:
+        raise ValueError("0x0A input report requires its ID and both trigger fields (15 bytes)")
     buf = [0] * 64
 
     b0_nso = data[3]
@@ -164,9 +165,8 @@ def _translate_report_0x0A(data) -> list:
     for i in range(6):
         buf[6 + i] = data[6 + i]
 
-    if len(data) > 14:
-        buf[13] = data[13]
-        buf[14] = data[14]
+    buf[13] = data[13]
+    buf[14] = data[14]
 
     return buf
 
@@ -189,6 +189,7 @@ class InputProcessor:
         self._ble_queue = ble_queue
 
         self.is_reading = False
+        self.malformed_report_count = 0
         self._stop_event = threading.Event()
         self._read_thread: Optional[threading.Thread] = None
         self._ui_update_counter = 0
@@ -230,6 +231,12 @@ class InputProcessor:
         """
         if self.is_reading:
             return
+        if self._read_thread is not None and self._read_thread.is_alive():
+            raise RuntimeError("Previous input reader has not stopped")
+        if mode not in ('usb', 'ble'):
+            raise ValueError(f"Unknown input transport: {mode}")
+        if mode == 'ble' and self._ble_queue is None:
+            raise ValueError("BLE input requires a queue")
         self.is_reading = True
         self._stop_event.clear()
         self._raw_mins = None
@@ -244,12 +251,12 @@ class InputProcessor:
 
     def stop(self):
         """Stop the HID reading thread."""
-        if not self.is_reading:
-            return
         self.is_reading = False
         self._stop_event.set()
-        if self._read_thread and self._read_thread.is_alive():
-            self._read_thread.join(timeout=1.0)
+        thread = self._read_thread
+        if (thread is not None and thread is not threading.current_thread()
+                and thread.is_alive()):
+            thread.join(timeout=1.0)
 
     def _read_loop(self):
         """Main HID reading loop using blocking read for minimal latency."""
@@ -266,35 +273,29 @@ class InputProcessor:
                     t_read = time.perf_counter()
                     if not data:
                         continue
-                    latest = data
-                    drain_count = 0
-                    device.set_nonblocking(1)
-                    try:
-                        for _ in range(63):
-                            more = device.read(64)
-                            if more:
-                                latest = more
-                                drain_count += 1
-                            else:
-                                break
-                    finally:
-                        device.set_nonblocking(0)
+                    # Process every report in FIFO order. Keeping only the latest
+                    # state erases a press/release queued between reader iterations.
+                    # Buffered HID reads already return immediately; no drain loop
+                    # or nonblocking-mode toggling is necessary.
                     if first_report:
                         first_report = False
                         logger.info("First USB report: id=0x%02X len=%d "
                                     "first16=%s",
-                                    latest[0] if latest else 0,
-                                    len(latest),
-                                    ' '.join(f'{b:02X}' for b in latest[:16]))
+                                    data[0], len(data),
+                                    ' '.join(f'{b:02X}' for b in data[:16]))
                     if IS_WINDOWS:
-                        if latest[0] == 0x05:
-                            latest = _translate_report_0x05(latest)
-                        elif latest[0] == 0x0A:
-                            latest = _translate_report_0x0A(latest)
-                        else:
-                            latest = latest[1:]
-                    self._process_data(latest, t_read=t_read,
-                                       drain_count=drain_count)
+                        try:
+                            if data[0] == 0x05:
+                                data = _translate_report_0x05(data)
+                            elif data[0] == 0x0A:
+                                data = _translate_report_0x0A(data)
+                            else:
+                                data = data[1:]
+                        except ValueError as exc:
+                            self.malformed_report_count += 1
+                            logger.debug("Ignoring malformed HID report: %s", exc)
+                            continue
+                    self._process_data(data, t_read=t_read)
                 except Exception as e:
                     if self.is_reading:
                         print(f"Read error: {e}")
@@ -311,19 +312,12 @@ class InputProcessor:
         try:
             while self.is_reading and not self._stop_event.is_set():
                 try:
-                    latest = self._ble_queue.get(timeout=0.008)
+                    data = self._ble_queue.get(timeout=0.008)
                 except queue.Empty:
                     continue
-                t_read = time.perf_counter()
-                drain_count = 0
-                try:
-                    while True:
-                        latest = self._ble_queue.get_nowait()
-                        drain_count += 1
-                except queue.Empty:
-                    pass
-                self._process_data(latest, t_read=t_read,
-                                   drain_count=drain_count)
+                # One report per iteration preserves digital edges and checks
+                # cancellation even when the producer continuously fills the queue.
+                self._process_data(data, t_read=time.perf_counter())
         except Exception as e:
             self._on_error(f"BLE read loop error: {e}")
         finally:
@@ -335,6 +329,7 @@ class InputProcessor:
                        drain_count: int = 0):
         """Process raw controller data and route to subsystems."""
         if len(data) < 15:
+            self.malformed_report_count += 1
             return
 
         # Connection warmup gate: during BLE -> USB transitions (and other
