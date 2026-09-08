@@ -35,6 +35,11 @@ provide a fallback. There is deliberately no first-device or bus-only fallback.
 If identity is unavailable or ambiguous, HID input remains usable but USB rumble
 and player LEDs return false. The log records the missing association.
 
+Slot migration moves the HID handle, claimed path and USB feedback binding
+under both managers' locks. It clears the old slot's binding and refuses to
+overwrite a live destination. Five regression tests cover the transfer and the
+actual application migration path, including a rejected transfer.
+
 Initialization no longer resets an already configured USB device. Permission,
 configuration, and claim errors terminate that operation instead of being
 silently treated as success. Interface ownership and handles are released on
