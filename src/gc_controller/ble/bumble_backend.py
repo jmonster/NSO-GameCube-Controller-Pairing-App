@@ -364,11 +364,14 @@ class BumbleBackend:
                 pass
 
         self._device.on("advertisement", on_advertisement)
-        await self._device.start_scanning(filter_duplicates=False)
-
-        await asyncio.sleep(scan_timeout)
-
-        await self._device.stop_scanning()
+        try:
+            await self._device.start_scanning(filter_duplicates=False)
+            await asyncio.sleep(scan_timeout)
+        finally:
+            try:
+                await self._device.stop_scanning()
+            finally:
+                self._device.remove_listener("advertisement", on_advertisement)
 
         return list(found.values())
 
