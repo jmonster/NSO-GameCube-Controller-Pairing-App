@@ -11,9 +11,12 @@ device_links (cross-transport identity pairing) on top of v3.
 import json
 import logging
 import os
+import threading
 from typing import List
 
 from .controller_constants import DEFAULT_CALIBRATION, MAX_SLOTS, BLE_DEVICE_CAL_KEYS
+
+from .settings_storage import atomic_write
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,7 @@ class SettingsManager:
     def __init__(self, slot_calibrations: List[dict], settings_dir: str):
         self._slot_calibrations = slot_calibrations
         self._settings_file = os.path.join(settings_dir, 'gc_controller_settings.json')
+        self._save_lock = threading.Lock()
 
     def load(self):
         """Load settings from file. Handles v1, v2, v3, and v4 formats."""
@@ -39,7 +43,7 @@ class SettingsManager:
             if not os.path.exists(self._settings_file):
                 logger.debug("No settings file at %s", self._settings_file)
                 return
-            with open(self._settings_file, 'r') as f:
+            with open(self._settings_file, 'r', encoding='utf-8') as f:
                 saved = json.load(f)
 
             version = saved.get('version', 1)
@@ -123,13 +127,11 @@ class SettingsManager:
 
     def save(self):
         """Write settings in v4 format (global only). Raises on failure."""
-        cal = self._slot_calibrations[0]
-        global_settings = {key: cal[key] for key in _GLOBAL_KEYS if key in cal}
-
-        output = {
-            'version': 4,
-            'global': global_settings,
-        }
-
-        with open(self._settings_file, 'w') as f:
-            json.dump(output, f, indent=2)
+        with self._save_lock:
+            cal = self._slot_calibrations[0]
+            global_settings = {key: cal[key] for key in _GLOBAL_KEYS if key in cal}
+            output = {'version': 4, 'global': global_settings}
+            # Serialize before touching the filesystem. A bad value, failed
+            # write, or failed replacement leaves the last valid file intact.
+            payload = json.dumps(output, indent=2, allow_nan=False).encode('utf-8')
+            atomic_write(self._settings_file, payload)
