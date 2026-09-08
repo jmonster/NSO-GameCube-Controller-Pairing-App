@@ -186,15 +186,10 @@ class GCControllerEnabler:
         if 'device_links' not in self.slot_calibrations[0]:
             self.slot_calibrations[0]['device_links'] = {}
 
-        # Clear stale BLE slot_assignments from previous sessions.
-        # On macOS, CoreBluetooth UUIDs are session-dependent and can change,
-        # so persisting them across restarts causes wrong slot assignments.
-        # Within a session, assignments are re-created as controllers connect,
-        # preserving slot stability for disconnect/reconnect cycles.
-        assignments = self.slot_calibrations[0]['slot_assignments']
-        stale_ble = [k for k in assignments if k.startswith('ble:')]
-        for k in stale_ble:
-            del assignments[k]
+        # Keep saved USB and BLE player assignments across restarts. A
+        # CoreBluetooth identifier is host-specific, not process-specific.
+        # A stale identifier should be handled by reconnect/forget, never by
+        # deleting all BLE preferences on every platform at startup.
 
         # Propagate per-slot global settings from slot 0 to all other slots
         for key in ('trigger_bump_100_percent', 'emulation_mode', 'stick_deadzone',
@@ -1910,32 +1905,16 @@ class GCControllerEnabler:
             _do_connect(slot_idx, hid_info)
 
     def _sync_player_leds(self):
-        """Re-send player LED commands to all connected USB controllers.
+        """Route LEDs through each slot's verified HID/USB device binding."""
 
-        Uses IOKit registry on macOS to correctly map each slot's HID device
-        to its USB device, ensuring LEDs match GUI slot numbers.
-        """
-        hid_to_bus = ConnectionManager.build_hid_to_usb_bus_map()
-        usb_devices = ConnectionManager.enumerate_usb_devices()
-        bus_to_usb = {u.bus: u for u in usb_devices}
 
         for slot_idx, slot in enumerate(self.slots):
-            if not slot.is_connected or not slot.device_path:
+            if not slot.is_connected or slot.connection_mode != 'usb':
+
+
                 continue
 
-            path_str = slot.device_path
-            if isinstance(path_str, bytes):
-                path_str = path_str.decode('utf-8', errors='replace')
-
-            try:
-                dev_srv_id = int(path_str.split(':')[1])
-            except (IndexError, ValueError):
-                continue
-
-            bus = hid_to_bus.get(dev_srv_id)
-            if bus is not None and bus in bus_to_usb:
-                ConnectionManager.set_player_led_usb(
-                    bus_to_usb[bus], slot_idx + 1)
+            slot.conn_mgr.set_player_led(slot_idx + 1)
 
     def _auto_connect_then_hotplug(self):
         """Run startup auto-connect, then start hotplug polling."""
@@ -2159,10 +2138,14 @@ class GCControllerEnabler:
         if usb_slot_obj.emu_mgr.is_emulating:
             usb_slot_obj.emu_mgr.stop()
         saved_path = usb_slot_obj.device_path
-        saved_hid = usb_slot_obj.conn_mgr.device
+        target_slot = self.slots[ble_slot]
+        if not usb_slot_obj.conn_mgr.transfer_to(target_slot.conn_mgr):
+            usb_slot_obj.input_proc.start()
+            if was_emulating:
+                self.toggle_emulation(usb_slot)
+            return
 
-        # Detach without closing the HID handle
-        usb_slot_obj.conn_mgr.device = None
+        # The complete HID/feedback session now belongs to the target slot.
         usb_slot_obj.device_path = None
         usb_slot_obj.device_identity = None
         usb_slot_obj.connection_mode = 'usb'
@@ -2174,10 +2157,8 @@ class GCControllerEnabler:
         self.ui.update_tab_status(usb_slot, connected=False, emulating=False)
 
         # Re-attach on the BLE slot
-        target_slot = self.slots[ble_slot]
         target_sui = self.ui.slots[ble_slot]
 
-        target_slot.conn_mgr.device = saved_hid
         target_slot.device_path = saved_path
         target_slot.connection_mode = 'usb'
         target_slot.device_identity = usb_id
@@ -2986,9 +2967,15 @@ class GCControllerEnabler:
 
     def run(self):
         """Start the application."""
-        if self._start_minimized and _TRAY_AVAILABLE and self._tray_icon:
-            self.root.withdraw()
-            self._tray_icon.visible = True
+        if self._start_minimized:
+            if _TRAY_AVAILABLE and self._tray_icon:
+                self.root.withdraw()
+                self._tray_icon.visible = True
+            else:
+                # macOS deliberately has no pystray event loop. Native
+                # minimization remains recoverable through the Dock/window
+                # manager, including when an optional tray backend fails.
+                self.root.iconify()
         self.root.mainloop()
 
 

@@ -5,13 +5,17 @@ Handles USB initialization and HID device connection for the GameCube controller
 Supports multi-device enumeration and path-targeted open for multi-controller setups.
 """
 
+from contextlib import contextmanager
 import logging
+from pathlib import Path
+import threading
 import sys
 from typing import Optional, Callable, List
 
 import subprocess
 
 import hid
+import usb.control
 import usb.core
 import usb.util
 
@@ -20,6 +24,49 @@ from .controller_constants import VENDOR_ID, PRODUCT_ID, DEFAULT_REPORT_DATA, SE
 logger = logging.getLogger(__name__)
 IS_MACOS = sys.platform == "darwin"
 
+
+# Initializers and feedback may run on different slot/worker threads. Do not
+# let one operation dispose a PyUSB handle another operation is still using.
+_USB_COMMAND_LOCK = threading.RLock()
+
+
+@contextmanager
+def _usb_command_interface(dev, *, configure=False):
+    """Own interface 1 and release all resources on every exit path."""
+    with _USB_COMMAND_LOCK:
+        claimed = False
+        detached = False
+        try:
+            if IS_MACOS:
+                try:
+                    active = dev.is_kernel_driver_active(1)
+                except NotImplementedError:
+                    active = False
+                if active:
+                    dev.detach_kernel_driver(1)
+                    detached = True
+            # Reapplying an active configuration can reset other interfaces.
+            # A failed query/claim is not evidence that it was already done.
+            if configure and usb.control.get_configuration(dev) == 0:
+                dev.set_configuration()
+            usb.util.claim_interface(dev, 1)
+            claimed = True
+            yield dev
+        finally:
+            if claimed:
+                try:
+                    usb.util.release_interface(dev, 1)
+                except Exception:
+                    logger.debug("Failed to release USB command interface", exc_info=True)
+            if detached:
+                try:
+                    dev.attach_kernel_driver(1)
+                except Exception:
+                    logger.debug("Failed to restore USB kernel driver", exc_info=True)
+            try:
+                usb.util.dispose_resources(dev)
+            except Exception:
+                logger.debug("Failed to dispose USB resources", exc_info=True)
 
 class ConnectionManager:
     """Manages USB initialization and HID connection."""
@@ -30,6 +77,8 @@ class ConnectionManager:
         self.device: Optional[hid.device] = None
         self.device_path: Optional[bytes] = None
 
+        self._usb_device = None
+        self._session_lock = threading.RLock()
     @staticmethod
     def enumerate_devices() -> List[dict]:
         """Return a list of HID device info dicts for all connected GC controllers."""
@@ -75,47 +124,23 @@ class ConnectionManager:
             self._on_status("Device found")
             self._on_progress(30)
 
-            if IS_MACOS:
-                try:
-                    if dev.is_kernel_driver_active(1):
-                        dev.detach_kernel_driver(1)
-                except (usb.core.USBError, NotImplementedError):
-                    pass
+            with _usb_command_interface(dev, configure=True):
+                self._on_progress(50)
+                self._on_status("Sending initialization data...")
+                dev.write(0x02, DEFAULT_REPORT_DATA, 2000)
+                self._on_progress(70)
+                self._on_status("Sending LED data...")
+                dev.write(0x02, SET_LED_DATA, 2000)
+                self._on_progress(90)
 
-            try:
-                dev.set_configuration()
-            except usb.core.USBError:
-                pass  # May already be configured
 
-            try:
-                usb.util.claim_interface(dev, 1)
-            except usb.core.USBError:
-                pass  # May already be claimed
 
-            self._on_progress(50)
 
-            self._on_status("Sending initialization data...")
-            dev.write(0x02, DEFAULT_REPORT_DATA, 2000)
 
-            self._on_progress(70)
 
-            self._on_status("Sending LED data...")
-            dev.write(0x02, SET_LED_DATA, 2000)
 
-            self._on_progress(90)
 
-            try:
-                usb.util.release_interface(dev, 1)
-            except usb.core.USBError:
-                pass
 
-            # Release pyusb resources so the handle is fully closed before
-            # HIDAPI opens the device — prevents conflicts on Windows where
-            # WinUSB and HID class driver can't share the device.
-            try:
-                usb.util.dispose_resources(dev)
-            except Exception:
-                pass
 
             self._on_status("USB initialization complete")
             return True
@@ -140,25 +165,8 @@ class ConnectionManager:
         led_data[8] = led_mask
 
         try:
-            if IS_MACOS:
-                try:
-                    if usb_device.is_kernel_driver_active(1):
-                        usb_device.detach_kernel_driver(1)
-                except (usb.core.USBError, NotImplementedError):
-                    pass
-            try:
-                usb.util.claim_interface(usb_device, 1)
-            except usb.core.USBError:
-                pass
-            usb_device.write(0x02, bytes(led_data), 2000)
-            try:
-                usb.util.release_interface(usb_device, 1)
-            except usb.core.USBError:
-                pass
-            try:
-                usb.util.dispose_resources(usb_device)
-            except Exception:
-                pass
+            with _usb_command_interface(usb_device):
+                usb_device.write(0x02, bytes(led_data), 2000)
             logger.debug("Set player LED via USB: player=%d mask=0x%02x", player_num, led_mask)
             return True
         except Exception as e:
@@ -166,10 +174,11 @@ class ConnectionManager:
             return False
 
     @staticmethod
-    def build_hid_to_usb_bus_map() -> dict:
-        """Map HID DevSrvsID → USB bus number using IOKit registry (macOS only).
+    def build_hid_to_usb_address_map() -> dict:
+        """Map macOS HID registry IDs to (libusb bus, device address).
 
-        Returns dict of {devsrvs_id: usb_bus_number}.
+        A bus alone is not an identity: every controller on a hub may share
+        it. Missing address information deliberately yields no match.
         """
         if not IS_MACOS:
             return {}
@@ -178,67 +187,180 @@ class ConnectionManager:
             import plistlib
             result = subprocess.run(
                 ['ioreg', '-r', '-c', 'IOUSBHostDevice', '-a'],
-                capture_output=True, timeout=5)
+                capture_output=True, timeout=5, check=True)
             devices = plistlib.loads(result.stdout)
         except Exception:
+            logger.debug("Could not read USB device ancestry", exc_info=True)
             return {}
 
-        mapping = {}
+        def hid_ids(children):
 
-        def _find_hid_entry_id(children):
             for child in (children if isinstance(children, list) else [children]):
                 if not isinstance(child, dict):
                     continue
                 if child.get('IORegistryEntryName') == 'AppleUserUSBHostHIDDevice':
-                    return child.get('IORegistryEntryID')
-                sub = child.get('IORegistryEntryChildren', [])
-                if sub:
-                    r = _find_hid_entry_id(sub)
-                    if r:
-                        return r
-            return None
+                    entry_id = child.get('IORegistryEntryID')
+                    if isinstance(entry_id, int):
+                        yield entry_id
+                yield from hid_ids(child.get('IORegistryEntryChildren', []))
 
-        for dev in devices:
+        mapping = {}
+        for dev in devices if isinstance(devices, list) else []:
+            if not isinstance(dev, dict):
+                continue
+
             if dev.get('idVendor') != VENDOR_ID or dev.get('idProduct') != PRODUCT_ID:
                 continue
-            loc_id = dev.get('locationID', 0)
-            bus = (loc_id >> 24) & 0xFF
-            hid_id = _find_hid_entry_id(dev.get('IORegistryEntryChildren', []))
-            if hid_id is not None:
-                mapping[hid_id] = bus
+            location = dev.get('locationID')
+            address = dev.get('USB Address', dev.get('USBAddress'))
+            if not isinstance(location, int) or not isinstance(address, int):
+                continue
+            if not 1 <= address <= 127:
+                continue
+            # libusb's Darwin backend derives its bus from locationID.
+            identity = ((location >> 24) & 0xFF, address)
+            for entry_id in hid_ids(dev.get('IORegistryEntryChildren', [])):
+                mapping[entry_id] = identity
 
-        logger.debug("HID→USB bus map: %s", mapping)
         return mapping
 
-    def init_hid_device(self, device_path: Optional[bytes] = None) -> bool:
-        """Initialize HID connection.
 
-        If device_path is provided, open that specific device by path.
-        Otherwise, open the first matching VID/PID device.
-        """
+    @staticmethod
+    def build_hid_to_usb_bus_map() -> dict:
+        """Legacy diagnostic helper; do not use a bus alone to route output."""
+        return {key: identity[0] for key, identity in
+                ConnectionManager.build_hid_to_usb_address_map().items()}
+
+    @staticmethod
+    def _linux_usb_address(device_path) -> Optional[tuple]:
+        """Resolve a hidraw node through its actual USB sysfs ancestry."""
         try:
-            self._on_status("Connecting via HID...")
+            path = device_path.decode() if isinstance(device_path, bytes) else str(device_path)
+            if not path.startswith('/dev/hidraw') or '/' in path[len('/dev/'):]:
+                return None
+            node = (Path('/sys/class/hidraw') / Path(path).name / 'device').resolve(strict=True)
+            for parent in (node, *node.parents):
+                vendor = parent / 'idVendor'
+                product = parent / 'idProduct'
+                if not vendor.is_file() or not product.is_file():
+                    continue
+                if (int(vendor.read_text().strip(), 16) != VENDOR_ID or
+                        int(product.read_text().strip(), 16) != PRODUCT_ID):
+                    return None
+                return (int((parent / 'busnum').read_text().strip()),
+                        int((parent / 'devnum').read_text().strip()))
+        except (OSError, ValueError, UnicodeError):
+            logger.debug("Could not resolve hidraw USB ancestry", exc_info=True)
+        return None
 
-            self.device = hid.device()
-            if device_path:
-                self.device.open_path(device_path)
-            else:
-                self.device.open(VENDOR_ID, PRODUCT_ID)
+    def _resolve_usb_device(self, device_path):
+        """Resolve only an unambiguous USB peer of this HID path.
 
-            if self.device:
+        Never fall back to the first VID/PID match, even if only one USB
+        device is visible: the opened HID device could be a BLE controller.
+        """
+        if not device_path:
+            return None
+        devices = self.enumerate_usb_devices()
+        if not devices:
+            return None
+        identity = None
+        if IS_MACOS:
+            try:
+                path = device_path.decode() if isinstance(device_path, bytes) else device_path
+                prefix, registry_id = path.split(':', 1)
+                if prefix == 'DevSrvsID':
+                    identity = self.build_hid_to_usb_address_map().get(int(registry_id))
+            except (AttributeError, ValueError, UnicodeError):
+                pass
+        elif sys.platform.startswith('linux'):
+            identity = self._linux_usb_address(device_path)
+        if identity is not None:
+            matches = [dev for dev in devices
+                       if (dev.bus, dev.address) == identity]
+            return matches[0] if len(matches) == 1 else None
+
+        # HIDAPI/libusb paths differ across builds. A verified unique serial
+        # is a portable fallback, never an empty or unreadable descriptor.
+        infos = [info for info in self.enumerate_devices()
+                 if info.get('path') == device_path]
+        serials = {info.get('serial_number') for info in infos
+                   if info.get('serial_number')}
+        if len(serials) != 1:
+            return None
+        serial = serials.pop()
+        matches = []
+        for dev in devices:
+            try:
+                if dev.serial_number == serial:
+                    matches.append(dev)
+            except Exception:
+                # An unreadable peer could have the same serial. Do not
+                # claim uniqueness in the face of incomplete evidence.
+                return None
+            finally:
+                try:
+                    usb.util.dispose_resources(dev)
+                except Exception:
+                    logger.debug("Could not release serial-query handle", exc_info=True)
+        return matches[0] if len(matches) == 1 else None
+
+    def init_hid_device(self, device_path: Optional[bytes] = None) -> bool:
+        """Open a specific HID path and bind feedback to that same device."""
+        with self._session_lock:
+            if self.device is not None:
+                self._on_status("HID session is already open; disconnect it before reconnecting")
+                return False
+            candidate = None
+            self.device_path = None
+            self._usb_device = None
+            try:
+                self._on_status("Connecting via HID...")
+                if not device_path:
+                    devices = self.enumerate_devices()
+                    if not devices or not devices[0].get('path'):
+                        self._on_status("Device not found")
+                        return False
+                    device_path = devices[0]['path']
+                candidate = hid.device()
+                candidate.open_path(device_path)
+                self.device = candidate
+
+
                 self.device_path = device_path
+                try:
+                    # Serialize descriptor access with commands as it also
+                    # opens and disposes PyUSB handles.
+                    with _USB_COMMAND_LOCK:
+                        self._usb_device = self._resolve_usb_device(device_path)
+                except Exception:
+                    logger.debug("USB feedback identity unavailable", exc_info=True)
+                if self._usb_device is None:
+                    logger.info("USB feedback disabled: no verified peer for HID path %r", device_path)
                 if sys.platform == 'win32':
                     self._try_hid_init()
                 self._on_status("Connected via HID")
                 self._on_progress(100)
                 return True
-            else:
-                self._on_status("Failed to connect via HID")
+            except Exception as e:
+                if candidate is not None:
+                    try:
+                        candidate.close()
+                    except Exception:
+                        logger.debug("Could not close failed HID open", exc_info=True)
+                self.device = None
+                self.device_path = None
+                self._usb_device = None
+                self._on_status(f"HID connection failed: {e}")
                 return False
 
-        except Exception as e:
-            self._on_status(f"HID connection failed: {e}")
-            return False
+    def set_player_led(self, player_num: int) -> bool:
+        """Set LEDs on this session's verified USB peer, or fail closed."""
+        with self._session_lock:
+            if self.device is None or self._usb_device is None:
+                return False
+            return self.set_player_led_usb(self._usb_device, player_num)
+
 
     def _try_hid_init(self):
         """Try switching the controller from standard HID to proprietary GC mode.
@@ -267,52 +389,51 @@ class ConnectionManager:
             return False
         return self.init_hid_device(device_path=device_path)
 
-    def send_rumble(self, state: bool) -> bool:
-        """Send a rumble ON/OFF command.
+    def transfer_to(self, destination) -> bool:
+        """Move a stopped reader's HID handle and feedback binding together."""
+        if destination is self:
+            return False
+        first, second = sorted((self, destination), key=id)
+        with first._session_lock, second._session_lock:
+            if self.device is None or destination.device is not None:
+                return False
+            destination.device, self.device = self.device, None
+            destination.device_path, self.device_path = self.device_path, None
+            destination._usb_device, self._usb_device = self._usb_device, None
+            return True
 
-        Tries pyusb first (endpoint 0x02 on interface 1), then falls back
-        to HIDAPI write for Windows where pyusb/libusb is unavailable.
+    def send_rumble(self, state: bool) -> bool:
+        """Send rumble only to this session's verified USB peer.
+
+        USB interface 0 is input-only; there is no HID-write fallback when
+        libusb cannot access command interface 1. BLE has its own backend.
+
         """
         cmd = bytes([0x0a, 0x91, 0x00, 0x02, 0x00, 0x04,
                      0x00, 0x00, 0x01 if state else 0x00,
                      0x00, 0x00, 0x00])
 
-        # Try pyusb (works on Linux/macOS)
-        try:
-            dev = usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID)
-            if dev is not None:
-                try:
-                    try:
-                        usb.util.claim_interface(dev, 1)
-                    except usb.core.USBError:
-                        pass
-                    dev.write(0x02, cmd, 1000)
-                    try:
-                        usb.util.release_interface(dev, 1)
-                    except usb.core.USBError:
-                        pass
-                    return True
-                except Exception:
-                    pass
-                finally:
-                    try:
-                        usb.util.dispose_resources(dev)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        with self._session_lock:
+            if self.device is None or self._usb_device is None:
+                return False
+            try:
+                with _usb_command_interface(self._usb_device):
+                    self._usb_device.write(0x02, cmd, 1000)
+                return True
+            except Exception:
+                logger.debug("USB rumble failed for this controller", exc_info=True)
+                return False
 
-        # Windows USB: HID interface 0 is input-only (no output endpoint),
-        # so rumble is unavailable without libusb/WinUSB for interface 1.
-        # Rumble works on Windows via BLE (Bleak backend).
-        return False
 
     def disconnect(self):
-        """Close and release the HID device."""
-        if self.device:
-            try:
-                self.device.close()
-            except Exception:
-                pass
+        """Close the HID session and invalidate its USB feedback binding."""
+        with self._session_lock:
+            device = self.device
             self.device = None
             self.device_path = None
+            self._usb_device = None
+            if device is not None:
+                try:
+                    device.close()
+                except Exception:
+                    logger.debug("Could not close HID device", exc_info=True)
