@@ -38,7 +38,10 @@ platform/macos/build.sh
 platform/windows/build.bat
 ```
 
-There is no test suite in this project.
+Run regression tests with `python -m unittest discover -s tests -v` and compile
+production modules with `python -m compileall -q src`. Tests use explicit
+hardware fakes and a real loopback UDP smoke test. See
+`docs/stabilization-validation.md` and `docs/fork-review.md` for limits and ports.
 
 ## Architecture
 
@@ -109,12 +112,12 @@ GUI (customtkinter) → App Orchestrator (app.py)
 
 ## Important Patterns
 
-- **Latency optimizations**: Blocking HID reads (no sleep), BLE queue draining, delta-only button updates, lock-free calibration hot path, pre-allocated buffers (BLE protocol + DSU packets), binary IPC for BLE subprocess data, platform-specific BLE connection interval tuning
+- **Latency optimizations**: Blocking HID reads (no sleep), ordered BLE input delivery, delta-only button updates, lock-free calibration hot path, pre-allocated buffers (BLE protocol + DSU packets), binary IPC for BLE subprocess data, platform-specific BLE connection interval tuning
 - **Thread safety**: Calibration modifications use locks; UI updates go through `root.after()` to stay on the Tkinter main thread
 - **Device claiming**: Path-based to prevent two slots from connecting to the same physical controller
 - **Report formats**: Standard GC USB binary format vs Windows NSO (report ID 0x05, different button encoding handled via `_translate_report_0x05()`) vs BLE (63-byte native Switch format)
 - **Platform detection**: Uses `sys.platform` throughout (`win32`, `linux`, `darwin`)
-- **BLE state**: Lazy initialization on first pair; subprocess messaging via events/queues
+- **BLE state**: Lazy initialization on first pair; shared child runtime, bounded ordered output, owning-session checks, and parent EOF retirement
 - **PyInstaller builds**: vgamepad DLL paths need special handling in frozen builds via `sys._MEIPASS`
 - **Entry points**: `--ble-subprocess` and `--bleak-subprocess` flags in `__main__.py` dispatch to BLE subprocess runners instead of the main app; `--latency` enables per-slot profiling output to stderr; `--minimized` starts in system tray (used by autostart)
 - **System tray**: Uses `pystray` with platform-specific backends (AppIndicator on Linux, native on macOS/Windows). Optional — gracefully disabled if unavailable.

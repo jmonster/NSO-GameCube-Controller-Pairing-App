@@ -19,7 +19,12 @@ This verifies the changed logic, not optional-library integration or packaging.
 Coverage includes ordered USB/BLE reports, malformed-frame rejection, reader
 shutdown/restart, persistent BLE slot assignments, minimized startup without a
 tray backend, the macOS Bluetooth purpose string, first-run Dolphin paths and
-FIFO validation, USB transfer cleanup, and device-specific rumble/player LEDs.
+FIFO validation, USB transfer cleanup, and device-specific rumble/player LEDs. Follow-up coverage includes shared
+BLE child lifecycle, bounded output, partial writes, EOF/malformed IPC, owned
+callbacks, ready-input gates, targeted reconnects, settings publication failure,
+Tk worker dispatch, scan-response updates, Dolphin digital clicks and DSU
+packet/subscription validation. A real loopback UDP test checks malformed-traffic
+survival and per-slot streaming; Bluetooth and USB devices remain faked.
 
 The workflow runs these checks on Linux, macOS, and Windows with Python 3.12 and
 3.13. POSIX FIFO and symlink tests are skipped where the necessary filesystem
@@ -71,13 +76,59 @@ addresses or serial numbers unnecessarily.
 | Dolphin | No existing profile; custom user directory; reader exit and restart | Correct profile location and no collateral file overwrite; reconnection behavior verified |
 | Distribution | Clean Macs without Homebrew; each supported architecture | Complete native dependencies, functional Bluetooth, and successful signing/notarization checks |
 
+## BLE and persistence behavior in the follow-up batch
+
+Both child entry points use one command/session runtime. A successful GATT write
+is not sufficient to become ready: Bleak requires the documented service layout,
+input subscription and a 63-byte input report on the expected input channel;
+Bumble requires successful initialization plus input. This validates framing and
+readiness, not cryptographic authenticity or every proprietary response field.
+Connection attempts are bounded, cancelled tasks are awaited, and stale client
+callbacks do not remove a replacement client's state. Exact GATT layout and
+five-second ready-input deadlines need firmware/hardware validation.
+
+The child output queue is ordered and bounded. It handles partial/interrupted
+writes on a dedicated thread. Overflow is a transport failure, not permission to
+throw away a release event. Parent readers reject partial frames and retire BLE
+outputs on EOF or protocol loss. USB slots are left alone. A service failure
+requires a deliberate retry rather than an automatic privilege-prompt loop.
+This does not guarantee delivery after an OS/process failure or through a game
+that polls more slowly than a press/release transition.
+
+Both source and frozen applications use the platform settings directory. Source
+runs can migrate a bounded valid UTF-8 JSON settings file from their old working
+directory when no platform file exists. The old file is retained. Migration
+requires exclusive hard-link publication; unsupported filesystems log the
+failure and keep the legacy file intact. Normal saves serialize before writing
+and atomically replace a same-directory flushed/fsynced temporary file. This is
+not a guarantee against arbitrary filesystem corruption or all power-loss cases.
+
+DSU retains loopback-only binding, uses non-blocking sends, validates framing and
+CRC, limits expiring subscriptions and respects requested slots/MACs. UDP remains
+lossy and unauthenticated; do not expose it to an untrusted network. DNS/network
+access is not used in these tests; the UDP smoke test stays on loopback.
+
+Additional manual gates: cancel during scan/connect/pairing/init; kill the child
+while holding a button; stall parent output; reconnect after sleep; move a BLE
+controller between UI player slots and check rumble/disconnect ownership; test
+multiple WinRT connections; verify Bumble public host identity; and compare
+Dolphin partial trigger travel with digital clicks. Confirm denial/revocation
+of Bluetooth permission in the actual `.app`, not only source execution.
+
 ## Remaining stabilization work
 
-This batch does not fix BLE readiness validation, stale BLE callback ownership,
-subprocess output backpressure, cancellation/EOF cleanup, or output neutralization
-on every failure path. It also does not eliminate all application-level loops
-that initialize multiple USB devices during hotplug/reconnect. Those remain
-separate high-priority changes requiring full integration review and tests.
+The new failure handling is not a complete proof of all application lifetimes.
+Review pending virtual-gamepad creation versus Stop/Quit, UI/subprocess slot
+allocation across every reconnect path, parent command-pipe blocking, and
+application-level USB initialization loops. Strict settings value/schema
+validation, dependency lockfiles, full frozen-build smoke tests, signing and
+notarization remain outstanding. Linux BlueZ restoration and real USB driver
+reattachment still need release-level review and hardware testing.
+
+The BLE IPC format has bounded validation and child/process ownership but no
+wire-level generation identifier; already-buffered events across every possible
+same-process slot reuse need additional end-to-end testing. No claim is made
+that every race or output failure is resolved.
 
 There is no native CoreHID backend, iOS/tvOS port, new signing identity, or
 notarization automation in this batch.
