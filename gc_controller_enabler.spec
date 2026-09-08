@@ -299,6 +299,9 @@ if sys.platform == "darwin":
             'NSPrincipalClass': 'NSApplication',
             'NSAppleScriptEnabled': False,
             'NSHighResolutionCapable': True,
+            'NSBluetoothAlwaysUsageDescription': (
+                'Connect to your Nintendo GameCube controller and receive its input.'
+            ),
             'LSUIElement': False,
             'NSRequiresAquaSystemAppearance': False,
         },
