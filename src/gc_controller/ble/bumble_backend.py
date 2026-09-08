@@ -6,21 +6,27 @@ Bypasses BlueZ entirely for full control over SMP key distribution.
 """
 
 import asyncio
+import inspect
+import logging
 import queue
 from typing import Callable, Optional
 
 from bumble.device import Device, Peer, ConnectionParametersPreferences
-from bumble.hci import Address, HCI_LE_1M_PHY, HCI_LE_2M_PHY
+from bumble.hci import Address, HCI_LE_1M_PHY, HCI_LE_2M_PHY, OwnAddressType
 from bumble.pairing import PairingConfig, PairingDelegate
 from bumble.transport import open_transport
 from bumble import smp  # noqa: F401
 
-from .sw2_protocol import sw2_init, translate_ble_to_usb
+from .sw2_protocol import sw2_init, translate_ble_to_usb, public_host_address
+
+_logger = logging.getLogger(__name__)
+_INPUT_READY_TIMEOUT = 5.0
 
 # Known Nintendo BLE MAC OUI prefixes (first 3 octets)
 _NINTENDO_OUIS = (
     '3C:A9:AB', '98:B6:E9', '7C:BB:8A', '58:2F:40',
     'D8:6B:F7', '04:03:D6', 'A4:C0:E1', '40:F4:07',
+    'E0:EF:BF', '94:8E:6D',  # Jared Brick: observed NSO GC prefixes
 )
 
 
@@ -33,6 +39,10 @@ class BumbleBackend:
         self._connections: dict[str, object] = {}  # mac -> connection
         self._peers: dict[str, Peer] = {}  # mac -> Peer
         self._hci_index: Optional[int] = None
+        self._pending = {}
+        self._background_tasks = set()
+        self._security_tasks = {}
+        self.malformed_reports = 0
 
     @property
     def is_open(self) -> bool:
@@ -40,36 +50,44 @@ class BumbleBackend:
 
     async def open(self, hci_index: int):
         """Open the HCI transport and power on the Bumble device."""
-        self._hci_index = hci_index
-        transport_name = f"hci-socket:{hci_index}"
+        if self._device is not None:
+            if hci_index == self._hci_index:
+                return
+            await self.close()
+        try:
+            self._hci_index = hci_index
+            transport_name = f"hci-socket:{hci_index}"
 
-        self._transport = await open_transport(transport_name)
-        hci_source, hci_sink = self._transport
+            self._transport = await open_transport(transport_name)
+            hci_source, hci_sink = self._transport
 
-        self._device = Device.with_hci(
-            "Bumble-GC",
-            Address("F0:F1:F2:F3:F4:F5"),
-            hci_source,
-            hci_sink,
-        )
+            self._device = Device.with_hci(
+                "Bumble-GC",
+                Address("F0:F1:F2:F3:F4:F5"),
+                hci_source,
+                hci_sink,
+            )
 
-        # Configure SMP for Legacy "Just Works" with exact BlueRetro key distribution
-        self._device.pairing_config_factory = lambda connection: PairingConfig(
-            sc=False,
-            mitm=False,
-            bonding=True,
-            delegate=PairingDelegate(
-                io_capability=PairingDelegate.IoCapability.NO_OUTPUT_NO_INPUT,
-                local_initiator_key_distribution=(
-                    PairingDelegate.KeyDistribution.DISTRIBUTE_IDENTITY_KEY
+            # Configure SMP for Legacy "Just Works" with exact BlueRetro key distribution
+            self._device.pairing_config_factory = lambda connection: PairingConfig(
+                sc=False,
+                mitm=False,
+                bonding=True,
+                delegate=PairingDelegate(
+                    io_capability=PairingDelegate.IoCapability.NO_OUTPUT_NO_INPUT,
+                    local_initiator_key_distribution=(
+                        PairingDelegate.KeyDistribution.DISTRIBUTE_IDENTITY_KEY
+                    ),
+                    local_responder_key_distribution=(
+                        PairingDelegate.KeyDistribution.DISTRIBUTE_ENCRYPTION_KEY
+                    ),
                 ),
-                local_responder_key_distribution=(
-                    PairingDelegate.KeyDistribution.DISTRIBUTE_ENCRYPTION_KEY
-                ),
-            ),
-        )
+            )
 
-        await self._device.power_on()
+            await self._device.power_on()
+        except BaseException:
+            await self.close()
+            raise
 
     async def scan_and_connect(
         self,
@@ -110,135 +128,157 @@ class BumbleBackend:
                 on_status("No controller found")
                 return None
 
-        # Prevent double-connecting
-        if mac in self._connections:
-            on_status("Already connected to this controller")
-            return mac
-
-        # Connect
-        on_status("Connecting...")
+        mac = mac.upper().removesuffix('/P').removesuffix('/R')
+        if mac in self._connections or mac in self._pending:
+            on_status("Controller already has an active connection")
+            return None
         try:
+            public_host_address(self._device)
+        except (ValueError, TypeError) as exc:
+            on_status(str(exc))
+            return None
+
+        task = asyncio.current_task()
+        self._pending[mac] = task
+        connection = None
+        ready = False
+        disconnected, input_received = asyncio.Event(), asyncio.Event()
+        try:
+            on_status("Connecting...")
             connection = await self._device.connect(
                 Address(mac, Address.PUBLIC_DEVICE_ADDRESS),
+                # Port of jaredrbrick/09ca5b1: the proprietary pairing handshake
+                # registers public_address, so CONNECT_IND must use PUBLIC too.
+                own_address_type=OwnAddressType.PUBLIC,
                 connection_parameters_preferences={
-                    HCI_LE_1M_PHY: ConnectionParametersPreferences(
-                        connection_interval_min=7.5,
-                        connection_interval_max=15.0,
-                        max_latency=0,
-                        supervision_timeout=5000,
-                    ),
-                    HCI_LE_2M_PHY: ConnectionParametersPreferences(
-                        connection_interval_min=7.5,
-                        connection_interval_max=15.0,
-                        max_latency=0,
-                        supervision_timeout=5000,
-                    ),
+                    phy: ConnectionParametersPreferences(
+                        connection_interval_min=7.5, connection_interval_max=15.0,
+                        max_latency=0, supervision_timeout=5000)
+                    for phy in (HCI_LE_1M_PHY, HCI_LE_2M_PHY)
                 },
                 timeout=connect_timeout,
             )
-        except Exception as e:
-            on_status(f"Connection failed: {e}")
-            return None
+            self._connections[mac] = connection
+            security_tasks = self._security_tasks[mac] = set()
+            pairing_lock = asyncio.Lock()
 
-        self._connections[mac] = connection
-
-        # Track disconnection with an event, like the PoC
-        disconnected = asyncio.Event()
-
-        def _on_disconnection(reason):
-            disconnected.set()
-            self._connections.pop(mac, None)
-            self._peers.pop(mac, None)
-            on_disconnect()
-
-        connection.on("disconnection", _on_disconnection)
-
-        # Handle security requests from controller
-        async def _on_security_request(auth_req):
-            try:
-                await connection.pair()
-            except Exception:
-                pass
-
-        connection.on("security_request",
-                      lambda auth_req: asyncio.ensure_future(
-                          _on_security_request(auth_req)))
-
-        # SMP Legacy pairing
-        on_status("SMP pairing...")
-        try:
-            await connection.pair()
-        except Exception:
-            # Continue without SMP — proprietary pairing may still work
-            if disconnected.is_set():
+            def lost(reason=None):
+                nonlocal ready
+                disconnected.set()
+                input_received.set()
+                if self._connections.get(mac) is not connection:
+                    return
                 self._connections.pop(mac, None)
-                on_status("Disconnected during pairing")
+                self._peers.pop(mac, None)
+                for security in self._security_tasks.pop(mac, set()):
+                    security.cancel()
+                if ready:
+                    ready = False
+                    on_disconnect()
+
+            connection.on("disconnection", lost)
+
+            async def pair():
+                async with pairing_lock:
+                    if self._connections.get(mac) is connection:
+                        try:
+                            await connection.pair()
+                        except Exception:
+                            # Existing firmware may still accept proprietary
+                            # pairing after an SMP rejection. Readiness is required.
+                            _logger.debug("SMP pairing rejected", exc_info=True)
+
+            def security_request(auth_req):
+                if self._connections.get(mac) is connection:
+                    security = self._background(pair())
+                    security_tasks.add(security)
+                    security.add_done_callback(security_tasks.discard)
+
+            connection.on("security_request", security_request)
+            on_status("SMP pairing...")
+            await pair()
+            if disconnected.is_set():
+                return None
+            on_status("MTU exchange...")
+            peer = Peer(connection)
+            self._peers[mac] = peer
+            try:
+                await peer.request_mtu(512)
+            except Exception:
+                _logger.debug("MTU request rejected", exc_info=True)
+            self._log_connection_params(connection, peer, on_status)
+            on_status("Discovering services...")
+            await peer.discover_services()
+            for service in peer.services:
+                await service.discover_characteristics()
+                for char in service.characteristics:
+                    await char.discover_descriptors()
+            if disconnected.is_set():
                 return None
 
-        if disconnected.is_set():
-            self._connections.pop(mac, None)
-            on_status("Disconnected during pairing")
-            return None
-
-        # MTU exchange (SW2 input reports are 63 bytes)
-        on_status("MTU exchange...")
-        peer = Peer(connection)
-        self._peers[mac] = peer
-        try:
-            await peer.request_mtu(512)
-        except Exception:
-            pass
-
-        self._log_connection_params(connection, peer, on_status)
-
-        if disconnected.is_set():
-            self._connections.pop(mac, None)
-            self._peers.pop(mac, None)
-            return None
-
-        # GATT discovery
-        on_status("Discovering services...")
-        await peer.discover_services()
-        for service in peer.services:
-            await service.discover_characteristics()
-            for char in service.characteristics:
-                await char.discover_descriptors()
-
-        if disconnected.is_set():
-            self._connections.pop(mac, None)
-            return None
-
-        # Input notification callback: translate BLE format to USB-compatible 64 bytes
-        def _on_input(value: bytes):
-            try:
-                data_queue.put_nowait(translate_ble_to_usb(value))
-            except queue.Full:
-                pass
-
-        # Run SW2 init sequence
-        on_status("Initializing controller...")
-        success = await sw2_init(
-            peer=peer,
-            connection=connection,
-            device=self._device,
-            slot_index=slot_index,
-            on_input=_on_input,
-            on_status=on_status,
-            disconnected=disconnected,
-        )
-
-        if not success or disconnected.is_set():
-            self._connections.pop(mac, None)
-            self._peers.pop(mac, None)
-            if not disconnected.is_set():
+            def input_report(value):
+                if self._connections.get(mac) is not connection or disconnected.is_set():
+                    return
+                if len(value) != 63:
+                    self.malformed_reports += 1
+                    return
                 try:
-                    await connection.disconnect()
+                    data_queue.put_nowait(translate_ble_to_usb(value))
                 except Exception:
-                    pass
-            on_status("Controller init failed")
-            return None
+                    lost()
+                    self._background(self._disconnect_connection(mac, connection))
+                    return
+                input_received.set()
 
-        return mac
+            on_status("Initializing controller...")
+            success = await sw2_init(
+                peer=peer, connection=connection, device=self._device,
+                slot_index=slot_index, on_input=input_report,
+                on_status=on_status, disconnected=disconnected)
+            if not success or disconnected.is_set():
+                on_status("Controller init failed")
+                return None
+            await asyncio.wait_for(input_received.wait(), timeout=_INPUT_READY_TIMEOUT)
+            if disconnected.is_set():
+                return None
+            ready = True
+            return mac
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            on_status(f"Controller initialization failed: {str(exc) or type(exc).__name__}")
+            return None
+        finally:
+            try:
+                if not ready and connection is not None:
+                    await self._disconnect_connection(mac, connection)
+            finally:
+                if self._pending.get(mac) is task:
+                    self._pending.pop(mac, None)
+
+    def _background(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self._background_tasks.add(task)
+        def done(task):
+            self._background_tasks.discard(task)
+            if not task.cancelled() and task.exception() is not None:
+                _logger.error("BLE cleanup/security task failed: %s", task.exception())
+        task.add_done_callback(done)
+        return task
+
+    async def _disconnect_connection(self, mac, connection):
+        if self._connections.get(mac) is connection:
+            self._connections.pop(mac, None)
+            self._peers.pop(mac, None)
+            tasks = self._security_tasks.pop(mac, set())
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await asyncio.wait_for(connection.disconnect(), 5)
+        except Exception:
+            _logger.debug("Controller disconnect failed", exc_info=True)
 
     @staticmethod
     def _log_connection_params(connection, peer, on_status):
@@ -284,7 +324,8 @@ class BumbleBackend:
         Matches by Nintendo OUI prefix in the MAC address, mirroring
         the PoC's approach of matching by known MAC.
         """
-        exclude = set(exclude_addresses or [])
+        exclude = {a.upper().removesuffix('/P').removesuffix('/R')
+                   for a in (exclude_addresses or [])}
         found_event = asyncio.Event()
         found_mac = [None]
 
@@ -292,7 +333,7 @@ class BumbleBackend:
             try:
                 if found_event.is_set():
                     return
-                addr_str = str(advertisement.address).upper()
+                addr_str = str(advertisement.address).upper().removesuffix('/P').removesuffix('/R')
                 # Skip controllers that are already connected
                 if addr_str in self._connections:
                     return
@@ -301,7 +342,7 @@ class BumbleBackend:
                     return
                 # Match by Nintendo OUI prefix (same approach as PoC's MAC check)
                 for oui in _NINTENDO_OUIS:
-                    if oui in addr_str:
+                    if addr_str.startswith(oui):
                         found_mac[0] = addr_str
                         found_event.set()
                         return
@@ -309,14 +350,16 @@ class BumbleBackend:
                 pass
 
         self._device.on("advertisement", on_advertisement)
-        await self._device.start_scanning(filter_duplicates=False)
-
         try:
+            await self._device.start_scanning(filter_duplicates=False)
             await asyncio.wait_for(found_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             pass
         finally:
-            await self._device.stop_scanning()
+            try:
+                await self._device.stop_scanning()
+            finally:
+                self._device.remove_listener("advertisement", on_advertisement)
 
         return found_mac[0]
 
@@ -334,7 +377,7 @@ class BumbleBackend:
 
         def on_advertisement(advertisement):
             try:
-                addr_str = str(advertisement.address).upper()
+                addr_str = str(advertisement.address).upper().removesuffix('/P').removesuffix('/R')
                 # Skip devices already connected
                 if addr_str in self._connections:
                     return
@@ -377,6 +420,7 @@ class BumbleBackend:
 
     async def send_rumble(self, mac: str, packet: bytes) -> bool:
         """Send rumble packet to controller via ATT write (no response)."""
+        mac = mac.upper().removesuffix('/P').removesuffix('/R')
         peer = self._peers.get(mac)
         if not peer:
             return False
@@ -390,6 +434,7 @@ class BumbleBackend:
 
     async def set_led(self, mac: str, slot_index: int) -> bool:
         """Update the player LED on a connected controller."""
+        mac = mac.upper().removesuffix('/P').removesuffix('/R')
         peer = self._peers.get(mac)
         if not peer:
             return False
@@ -405,24 +450,31 @@ class BumbleBackend:
             return False
 
     async def disconnect(self, mac_address: str):
-        """Disconnect a specific controller."""
-        self._peers.pop(mac_address, None)
-        connection = self._connections.pop(mac_address, None)
-        if connection:
-            try:
-                await connection.disconnect()
-            except Exception:
-                pass
+        mac_address = mac_address.upper().removesuffix('/P').removesuffix('/R')
+        task = self._pending.get(mac_address)
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        connection = self._connections.get(mac_address)
+        if connection is not None:
+            await self._disconnect_connection(mac_address, connection)
 
     async def close(self):
-        """Disconnect all controllers and close the HCI transport."""
-        for mac in list(self._connections.keys()):
-            await self.disconnect(mac)
-
-        if self._transport:
-            try:
-                self._transport.close()
-            except Exception:
-                pass
-            self._transport = None
-        self._device = None
+        """Close connections AND await the HCI transport's asynchronous close."""
+        pending = [t for t in self._pending.values() if t is not asyncio.current_task()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        try:
+            for mac in list(self._connections):
+                await self.disconnect(mac)
+            if self._background_tasks:
+                await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        finally:
+            transport, self._transport = self._transport, None
+            self._device = None
+            if transport is not None:
+                result = transport.close()
+                if inspect.isawaitable(result):
+                    await result
