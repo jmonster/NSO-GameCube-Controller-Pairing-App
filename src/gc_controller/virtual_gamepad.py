@@ -637,29 +637,25 @@ _FLATPAK_DOLPHIN_DATA = os.path.join(
 
 
 def _get_all_dolphin_user_dirs() -> list[str]:
-    """Return all detected Dolphin user directories that exist on disk.
+    """Resolve Dolphin user directories, including a correct first-run default.
 
-    Checks every known location so that pipes are created in all of them,
-    regardless of how Dolphin was installed (Flatpak, native package, etc.).
-    Uses the real user's home when running under sudo.
+    An explicit DOLPHIN_EMU_USERPATH selects one directory on every platform,
+    even before it exists. Without an override, Linux retains multi-install
+    discovery and macOS uses its Application Support directory.
     """
-    if sys.platform == 'darwin':
-        d = os.path.join(_REAL_HOME, 'Library/Application Support/Dolphin')
-        return [d] if os.path.isdir(d) else []
 
-    # Linux — collect every directory that exists, deduplicating by realpath.
-    candidates: list[str] = []
 
     env_path = os.environ.get('DOLPHIN_EMU_USERPATH')
     if env_path:
-        candidates.append(env_path)
+        return [os.path.abspath(os.path.expanduser(env_path))]
+    if sys.platform == 'darwin':
+        return [os.path.join(_REAL_HOME, 'Library/Application Support/Dolphin')]
 
-    candidates.append(_FLATPAK_DOLPHIN_DATA)
-    candidates.append(os.path.join(_REAL_HOME, '.dolphin-emu'))
 
-    xdg_data = os.environ.get('XDG_DATA_HOME',
-                               os.path.join(_REAL_HOME, '.local/share'))
-    candidates.append(os.path.join(xdg_data, 'dolphin-emu'))
+    xdg_data = os.environ.get('XDG_DATA_HOME') or os.path.join(_REAL_HOME, '.local/share')
+    default_dir = os.path.join(xdg_data, 'dolphin-emu')
+    candidates = [_FLATPAK_DOLPHIN_DATA,
+                  os.path.join(_REAL_HOME, '.dolphin-emu'), default_dir]
 
     seen: set[str] = set()
     result: list[str] = []
@@ -668,7 +664,7 @@ def _get_all_dolphin_user_dirs() -> list[str]:
         if real not in seen and os.path.isdir(path):
             seen.add(real)
             result.append(path)
-    return result
+    return result or [default_dir]
 
 
 def ensure_dolphin_pipe(pipe_name: str = 'gc_controller') -> list[str]:
@@ -679,24 +675,27 @@ def ensure_dolphin_pipe(pipe_name: str = 'gc_controller') -> list[str]:
 
     Returns a list of all pipe paths that were created / verified.
     """
+    if (not isinstance(pipe_name, str) or not pipe_name
+            or pipe_name in ('.', '..') or '/' in pipe_name or '\\' in pipe_name):
+        raise ValueError("Dolphin pipe name must be a single filename")
     user_dirs = _get_all_dolphin_user_dirs()
-    if not user_dirs:
-        # No existing Dolphin dirs — fall back to XDG default.
-        xdg_data = os.environ.get('XDG_DATA_HOME',
-                                  os.path.expanduser('~/.local/share'))
-        user_dirs = [os.path.join(xdg_data, 'dolphin-emu')]
 
     pipe_paths: list[str] = []
     for user_dir in user_dirs:
         pipe_dir = os.path.join(user_dir, 'Pipes')
         try:
-            os.makedirs(pipe_dir, exist_ok=True)
+            os.makedirs(pipe_dir, mode=0o700, exist_ok=True)
             pipe_path = os.path.join(pipe_dir, pipe_name)
 
-            if not os.path.exists(pipe_path):
-                os.mkfifo(pipe_path)
-            elif not stat.S_ISFIFO(os.stat(pipe_path).st_mode):
-                continue  # skip non-FIFO files without failing
+            try:
+                os.mkfifo(pipe_path, mode=0o600)
+            except FileExistsError:
+                pass
+            # Do not follow symlinks or accept a regular file as controller
+            # output. lstat also handles a concurrent creator without deleting
+            # another application's files.
+            if not stat.S_ISFIFO(os.lstat(pipe_path).st_mode):
+                continue
 
             pipe_paths.append(pipe_path)
         except OSError:
