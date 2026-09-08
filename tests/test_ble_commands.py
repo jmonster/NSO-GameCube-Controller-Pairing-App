@@ -7,18 +7,18 @@ from _support import load_definitions
 
 
 class ParentCommandTests(unittest.TestCase):
-    def test_write_failure_is_delivered_with_original_process_owner(self):
-        method = load_definitions('app.py', {'_send_ble_cmd'}, {'json': json},
+    def test_commands_only_use_transport_owned_by_current_process(self):
+        method = load_definitions('app.py', {'_send_ble_cmd'},
                                   class_name='GCControllerEnabler')['_send_ble_cmd']
-        proc = types.SimpleNamespace(poll=lambda: None, stdin=Mock())
-        proc.stdin.write.side_effect = BrokenPipeError('closed')
-        app = types.SimpleNamespace(_ble_subprocess=proc, _call_on_ui_thread=Mock(),
-                                    _ble_service_lost=Mock())
+        proc = types.SimpleNamespace(stdin=Mock())
+        transport = Mock(process=proc)
+        app = types.SimpleNamespace(_ble_subprocess=proc, _ble_commands=transport)
         method(app, {'cmd': 'open'})
-        args = app._call_on_ui_thread.call_args.args
-        self.assertIs(args[1], proc)
-        self.assertIn('closed', args[2])
-        app._ble_service_lost.assert_not_called()
+        transport.send.assert_called_once_with({'cmd': 'open'})
+        proc.stdin.write.assert_not_called()
+        app._ble_subprocess = object()
+        self.assertFalse(method(app, {'cmd': 'open'}))
+        transport.send.assert_called_once()
 
     def test_rumble_includes_controller_address_when_ui_slot_was_reassigned(self):
         method = load_definitions('app.py', {'_set_rumble_hardware'},

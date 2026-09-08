@@ -101,6 +101,7 @@ from .controller_slot import ControllerSlot, normalize_ble_address
 from .ble.sw2_protocol import build_rumble_packet
 from .ui_dispatch import MainThreadDispatcher
 from .ble.ipc import read_event_stream
+from .ble.parent import CommandTransport
 
 # System tray support (optional).
 # On macOS, pystray runs [NSApplication run] from a background thread which
@@ -213,6 +214,7 @@ class GCControllerEnabler:
         # BLE state (lazy-initialized on first pair via privileged subprocess)
         self._ble_available = is_ble_available()
         self._ble_subprocess = None
+        self._ble_commands = None
         self._ble_reader_thread = None
         self._ble_stderr_thread = None
         self._ble_initialized = False
@@ -615,6 +617,10 @@ class GCControllerEnabler:
                 stderr=subprocess.PIPE,
             )
 
+        self._ble_commands = CommandTransport(
+            self._ble_subprocess,
+            lambda proc, reason: self._call_on_ui_thread(
+                self._ble_service_lost, proc, f'BLE command transport failed: {reason}'))
         self._ble_reader_thread = threading.Thread(
             target=self._ble_event_reader, args=(self._ble_subprocess,), daemon=True)
         self._ble_reader_thread.start()
@@ -623,19 +629,11 @@ class GCControllerEnabler:
         self._ble_stderr_thread.start()
 
     def _send_ble_cmd(self, cmd: dict):
-        """Send to the captured child, surfacing a failed command pipe as loss."""
-        proc = self._ble_subprocess
-        if proc is None:
-            return
-        try:
-            if proc.poll() is not None:
-                raise ConnectionError('BLE subprocess has exited')
-            line = json.dumps(cmd, separators=(',', ':')) + '\n'
-            proc.stdin.write(line.encode('utf-8'))
-            proc.stdin.flush()
-        except Exception as exc:
-            self._call_on_ui_thread(self._ble_service_lost, proc,
-                                   f'BLE command transport failed: {exc}')
+        """Enqueue an immutable command; no caller performs pipe IO."""
+        transport = self._ble_commands
+        if transport is not None and transport.process is self._ble_subprocess:
+            return transport.send(cmd)
+        return False
 
     def _wait_ble_init(self, timeout: float) -> dict | None:
         """Block until the next init event from the BLE subprocess."""
@@ -653,26 +651,13 @@ class GCControllerEnabler:
         return None
 
     def _cleanup_ble(self):
-        """Invalidate process ownership before closing pipes or waiting for exit."""
-        proc, self._ble_subprocess = self._ble_subprocess, None
+        """Retire ownership immediately; the transport reaps without blocking Tk."""
+        self._ble_subprocess = None
+        transport, self._ble_commands = self._ble_commands, None
         self._ble_initialized = False
         self._ble_slot_remap.clear()
-        if proc is None:
-            return
-        try:
-            proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            if proc.poll() is None:
-                proc.terminate()
-            proc.wait(timeout=3)
-        except Exception:
-            try:
-                proc.kill()
-                proc.wait(timeout=3)
-            except Exception:
-                logger.warning("BLE subprocess did not exit after termination")
+        if transport is not None:
+            transport.close()
 
     def _ble_event_reader(self, proc):
         """Read only the process captured at thread creation, never its successor."""
@@ -2953,14 +2938,13 @@ class GCControllerEnabler:
             slot.stop_emulation()
             slot.conn_mgr.disconnect()
 
-        # Clean up BLE subprocess
-        if self._ble_subprocess:
-            try:
-                self._send_ble_cmd({"cmd": "shutdown"})
-                self._ble_subprocess.wait(timeout=5.0)
-            except Exception:
-                pass
-            self._cleanup_ble()
+        # EOF/shutdown requests cleanup; retain the owner for the final bounded
+        # join so a privileged child is not abandoned at interpreter exit.
+        transport = self._ble_commands
+        self._send_ble_cmd({"cmd": "shutdown"})
+        self._cleanup_ble()
+        if transport is not None:
+            transport.close(wait=True)
 
         self.root.destroy()
 
@@ -3006,6 +2990,8 @@ class _BleHeadlessManager:
 
     def __init__(self):
         self._subprocess = None
+        self._commands = None
+        self._on_event = None
         self._reader_thread = None
         self._initialized = False
         self._init_event = threading.Event()
@@ -3043,15 +3029,23 @@ class _BleHeadlessManager:
                 stderr=subprocess.DEVNULL,
             )
 
+        self._commands = CommandTransport(self._subprocess, self._command_failed)
+
+    def _command_failed(self, proc, reason):
+        if self._subprocess is not proc:
+            return
+        self._initialized = False
+        self._init_result = {'e': 'error', 'ctx': 'ipc', 'msg': reason}
+        self._init_event.set()
+        if self._on_event is not None:
+            self._on_event({'e': 'service_lost', 'msg': reason, '_process': proc})
+
     def send_cmd(self, cmd: dict):
-        """Send a JSON-line command to the BLE subprocess."""
-        if self._subprocess and self._subprocess.poll() is None:
-            try:
-                line = json.dumps(cmd, separators=(',', ':')) + '\n'
-                self._subprocess.stdin.write(line.encode('utf-8'))
-                self._subprocess.stdin.flush()
-            except Exception:
-                pass
+        """Enqueue commands with the same failure semantics as the GUI."""
+        transport = self._commands
+        if transport is not None and transport.process is self._subprocess:
+            return transport.send(cmd)
+        return False
 
     def _wait_init(self, timeout: float) -> dict | None:
         """Block until the next init event from the BLE subprocess."""
@@ -3129,6 +3123,7 @@ class _BleHeadlessManager:
             on_data: callback(slot_index, data_bytes) for low-latency data events
             on_event: callback(event_dict) for runtime events (connected, disconnected, etc.)
         """
+        self._on_event = on_event
         self._reader_thread = threading.Thread(
             target=self._event_reader, args=(on_data, on_event, self._subprocess), daemon=True)
         self._reader_thread.start()
@@ -3165,27 +3160,12 @@ class _BleHeadlessManager:
                 on_event({'e': 'service_lost', 'msg': reason, '_process': proc})
 
     def shutdown(self):
-        """Retire ownership before a closing reader can publish stale callbacks."""
-        proc, self._subprocess = self._subprocess, None
+        """Retire callbacks before a bounded, owned EOF/terminate/kill sequence."""
+        self._subprocess = None
+        transport, self._commands = self._commands, None
         self._initialized = False
-        if proc is None:
-            return
-        try:
-            proc.stdin.close()  # EOF asks both children to run backend cleanup.
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            try:
-                proc.terminate()
-                proc.wait(timeout=3)
-            except Exception:
-                try:
-                    proc.kill()
-                    proc.wait(timeout=3)
-                except Exception:
-                    logger.warning("BLE subprocess did not exit after termination")
+        if transport is not None:
+            transport.close(wait=True)
 
     @property
     def is_alive(self) -> bool:

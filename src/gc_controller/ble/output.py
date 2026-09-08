@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import threading
+import time
 
 from .ipc import MAX_JSON_BYTES, MAX_SLOTS
 
@@ -20,9 +21,15 @@ class OutputWriter:
     """
 
     def __init__(self, fd, on_failure, *, max_bytes=128 * 1024,
-                 max_frames=512, write=None):
+                 max_frames=512, write=None, write_timeout=None, on_close=None):
         if max_bytes <= 0 or max_frames <= 0:
             raise ValueError('Output limits must be positive')
+        if write_timeout is not None and write_timeout <= 0:
+            raise ValueError('write_timeout must be positive')
+        self._write_timeout = write_timeout
+        self._on_close = on_close
+        self._writing_since = None
+        self._finished = threading.Event()
         self._fd = fd
         self._write = os.write if write is None else write
         self._on_failure = on_failure
@@ -35,6 +42,9 @@ class OutputWriter:
         self._failure = None
         self._thread = threading.Thread(target=self._run, name='ble-output', daemon=True)
         self._thread.start()
+        if write_timeout is not None:
+            threading.Thread(target=self._watchdog, name='ble-write-watchdog',
+                             daemon=True).start()
 
     def _fail(self, error):
         with self._condition:
@@ -88,6 +98,7 @@ class OutputWriter:
                         return
                     frame = self._frames.popleft()
                     self._bytes -= len(frame)
+                    self._writing_since = time.monotonic()
                 # Single writer prevents JSON/input interleaving even when the
                 # kernel accepts only part of a frame.
                 view = memoryview(frame)
@@ -99,8 +110,29 @@ class OutputWriter:
                     if written <= 0 or written > len(view):
                         raise OSError('Invalid/zero-length BLE pipe write')
                     view = view[written:]
+                    with self._condition:
+                        self._writing_since = time.monotonic() if view else None
         except Exception as error:
             self._fail(error)
+        finally:
+            # The writer owns closure: never close a descriptor while another
+            # thread can still be blocked writing to it (descriptor reuse).
+            try:
+                if self._on_close is not None:
+                    self._on_close()
+            except Exception:
+                _logger.debug('BLE pipe close failed', exc_info=True)
+            self._finished.set()
+
+    def _watchdog(self):
+        while not self._finished.wait(min(0.1, self._write_timeout / 4)):
+            with self._condition:
+                since, failed = self._writing_since, self._failure is not None
+            if failed:
+                return
+            if since is not None and time.monotonic() - since >= self._write_timeout:
+                self._fail(TimeoutError('BLE pipe write made no progress before its deadline'))
+                return
 
     def close(self, timeout=0.5):
         """Drain healthy output, without indefinitely waiting for a stalled parent."""
