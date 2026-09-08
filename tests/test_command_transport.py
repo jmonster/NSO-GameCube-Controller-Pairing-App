@@ -95,7 +95,8 @@ class CommandTransportTests(unittest.TestCase):
         # No radio, display, network or privileged command. This fills an actual
         # OS pipe on every CI host and verifies that shutdown releases its writer.
         proc = subprocess.Popen([sys.executable, '-u', '-c',
-                                 "import time; print('ready', flush=True); time.sleep(30)"],
+                                 "import sys,time; sys.stdout.buffer.write(b'ready\\n'); "
+                                 "sys.stdout.buffer.flush(); time.sleep(30)"],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         transport = None
         try:
@@ -118,7 +119,12 @@ class CommandTransportTests(unittest.TestCase):
         finally:
             if proc.poll() is None:
                 proc.kill(); proc.wait(timeout=3)
-            if transport is not None: transport.close(wait=True)
+            if transport is not None:
+                transport.close(wait=True)
+                transport._writer.close(2)
+            else:
+                # An early readiness failure happens before a writer owns stdin.
+                proc.stdin.close()
             proc.stdout.close()
 
     def test_headless_failure_wakes_initialization_and_emits_owned_loss(self):
