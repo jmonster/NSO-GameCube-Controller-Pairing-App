@@ -1,7 +1,6 @@
 name: Temporary stabilization workbench
 
-# Branch-scoped bridge for importing reviewed patches when the editing
-# environment cannot clone GitHub. Remove this workflow before merge.
+# Branch-scoped import bridge. Remove before merge.
 on:
   push:
     branches: [stabilize/controller-sessions-and-macos]
@@ -40,6 +39,21 @@ jobs:
           if (( ${#patches[@]} )); then
             git am "${patches[@]}"
             git rm -- "${patches[@]}"
+            git commit -m 'chore: remove applied stabilization import files'
+          fi
+          if [ -f _stabilization/batch.sha256 ]; then
+            python - <<'PY'
+          import base64, hashlib, lzma
+          from pathlib import Path
+          parts = sorted(Path('_stabilization').glob('batch.b64.*'))
+          assert parts, 'Missing patch payload'
+          payload = lzma.decompress(base64.b64decode(b''.join(p.read_bytes() for p in parts), validate=True))
+          expected = Path('_stabilization/batch.sha256').read_text().strip()
+          assert hashlib.sha256(payload).hexdigest() == expected, 'Patch checksum mismatch'
+          Path('/tmp/stabilization.patch').write_bytes(payload)
+          PY
+            git am /tmp/stabilization.patch
+            git rm -- _stabilization/batch.b64.* _stabilization/batch.sha256
             git commit -m 'chore: remove applied stabilization import files'
           fi
       - name: Validate production sources and regression tests
