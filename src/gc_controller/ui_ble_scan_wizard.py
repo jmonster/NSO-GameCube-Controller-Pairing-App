@@ -14,11 +14,13 @@ import customtkinter
 
 from . import ui_theme as T
 from .i18n import t
-from .ble_identifiers import NINTENDO_COMPANY_ID
 
 logger = logging.getLogger(__name__)
 
-_NINTENDO_COMPANY_IDS = frozenset({str(NINTENDO_COMPANY_ID)})
+_NINTENDO_COMPANY_IDS = frozenset({
+    '894',   # 0x037E — Nintendo (classic controllers)
+    '1363',  # 0x0553 — Nintendo (Switch 2 controllers)
+})
 
 _NINTENDO_SERVICE_UUIDS = frozenset({
     '00c5af5d-1964-4e30-8f51-1956f96bd280',
@@ -32,7 +34,6 @@ _NINTENDO_OUI = frozenset({
     '2C:10:C1', '34:AF:2C', '48:A5:E7', '64:B5:C6',
     '8C:56:C5', '9C:E6:35', 'A0:AB:1B', 'B0:9F:BA',
     'BC:83:85', 'E4:17:D8', 'E8:65:D4', 'EC:10:7B',
-    'E0:EF:BF', '94:8E:6D',
 })
 
 _CONTROLLER_NAME_PATTERNS = (
@@ -87,7 +88,6 @@ class BLEControllerScanDialog:
         self._controllers: list[dict] = []
         self._other_devices: list[dict] = []
         self._seen_addresses: set[str] = set()
-        self._devices_by_address: dict[str, dict] = {}
         self._auto_connect_timer: Optional[str] = None
         self._scanning = False
         self._closed = False
@@ -203,37 +203,29 @@ class BLEControllerScanDialog:
     # ── Device callbacks (called from app on main thread) ─────────
 
     def add_device(self, dev: dict):
-        """Merge partial scan responses; a first nameless advertisement is not final."""
+        """Called by the app when a new BLE device is detected during scan."""
         if self._closed:
             return
+
         addr = dev.get('address', '').upper()
-        if not addr or addr in self._exclude:
+        if not addr or addr in self._exclude or addr in self._seen_addresses:
             return
-        record = self._devices_by_address.get(addr)
-        was_controller = record is not None and record in self._controllers
-        if record is None:
-            record = {'address': addr}
-            self._devices_by_address[addr] = record
-            self._seen_addresses.add(addr)
-            self._other_devices.append(record)
-        previous_display = (record.get('name'), record.get('rssi'))
-        for key, value in dev.items():
-            if value is None or key == 'address':
-                continue
-            if key in ('name', 'manufacturer_data', 'service_uuids') and not value:
-                continue
-            record[key] = value
-        is_controller = was_controller or _is_likely_controller(record)
-        if is_controller and not was_controller:
-            self._other_devices.remove(record)
-            self._controllers.append(record)
-            logger.info('Scan: controller candidate %s name=%r', addr, record.get('name'))
+
+        self._seen_addresses.add(addr)
+        is_ctrl = _is_likely_controller(dev)
+
+        if is_ctrl:
+            self._controllers.append(dev)
+            logger.info("Scan: Nintendo controller detected: %s  name=%r  "
+                        "rssi=%s  mfg=%s",
+                        addr, dev.get('name'),
+                        dev.get('rssi'), dev.get('manufacturer_data', {}))
+        else:
+            self._other_devices.append(dev)
+
+        if is_ctrl:
             self._update_tree()
             self._reset_auto_connect_timer()
-        elif is_controller and previous_display != (record.get('name'), record.get('rssi')):
-            # Updates must neither restart the grace timer forever nor demote a
-            # controller when an advertisement omits its scan-response metadata.
-            self._update_tree()
 
     def _update_tree(self):
         """Rebuild or update the treeview with current controllers."""
@@ -248,19 +240,13 @@ class BLEControllerScanDialog:
         if not self._tree_initialized:
             self._init_tree()
 
-        # Preserve the user's chosen controller across signal/name updates.
-        selected_address = None
-        selection = self._tree.selection()
-        if selection:
-            values = self._tree.item(selection[0], 'values')
-            if len(values) > 1:
-                selected_address = values[1]
+        # Clear and re-insert
         for item in self._tree.get_children():
             self._tree.delete(item)
 
         sorted_ctrls = sorted(self._controllers,
                               key=lambda d: (d.get('rssi', -999) * -1))
-        first_iid = selected_iid = None
+        first_iid = None
         for dev in sorted_ctrls:
             rssi = dev.get('rssi', -999)
             signal = f"{rssi} dBm" if rssi > -999 else "?"
@@ -269,11 +255,9 @@ class BLEControllerScanDialog:
                 label, dev['address'], signal))
             if first_iid is None:
                 first_iid = iid
-            if dev['address'] == selected_address:
-                selected_iid = iid
 
         if first_iid:
-            self._tree.selection_set(selected_iid or first_iid)
+            self._tree.selection_set(first_iid)
 
         self._ensure_connect_btn()
 

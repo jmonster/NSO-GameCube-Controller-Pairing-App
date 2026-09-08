@@ -38,10 +38,7 @@ class ControllerSlot:
         self.index = index
         self.calibration = calibration
         self.device_path: Optional[bytes] = None
-        self.usb_pending = None
-        self.usb_pending_path = None
         self.reconnect_was_emulating = False
-        self._pipe_cancel = None
 
         # Stable device identity string for slot persistence
         self.device_identity: Optional[str] = None
@@ -70,13 +67,6 @@ class ControllerSlot:
             on_disconnect=on_disconnect,
             ble_queue=self.ble_data_queue,
         )
-
-    def stop_emulation(self):
-        """Cancel even a queued worker which has not entered its factory yet."""
-        cancel, self._pipe_cancel = self._pipe_cancel, None
-        if cancel is not None:
-            cancel.set()
-        self.emu_mgr.stop()
 
     @property
     def is_connected(self) -> bool:

@@ -62,9 +62,6 @@ class GamepadButton(Enum):
     DPAD_DOWN = auto()
     DPAD_LEFT = auto()
     DPAD_RIGHT = auto()
-    # Native GameCube trigger clicks; only exposed by the Dolphin backend.
-    L = auto()
-    R = auto()
 
 
 class VirtualGamepad(ABC):
@@ -727,9 +724,7 @@ class DolphinPipeGamepad(VirtualGamepad):
         GamepadButton.Y: 'Y',
         GamepadButton.START: 'START',
         GamepadButton.RIGHT_SHOULDER: 'Z',
-        GamepadButton.L: 'L',
-        GamepadButton.R: 'R',
-        # ZL has no Dolphin GameCube pipe token; it must not impersonate L.
+        GamepadButton.LEFT_SHOULDER: 'L',
         GamepadButton.DPAD_UP: 'D_UP',
         GamepadButton.DPAD_DOWN: 'D_DOWN',
         GamepadButton.DPAD_LEFT: 'D_LEFT',

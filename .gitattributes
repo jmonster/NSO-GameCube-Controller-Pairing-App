@@ -1,2 +1,0 @@
-# Hash-verified dependency data must have identical bytes on every checkout.
-requirements/locks/** text eol=lf

@@ -109,14 +109,14 @@ class ConnectionManager:
     def initialize_via_usb(self, usb_device=None) -> bool:
         """Initialize controller via USB.
 
-        An explicit device or an already verified HID binding is required.
-        Never initialize the first VID/PID match in a multi-controller process.
+        If usb_device is provided, use it directly instead of scanning.
         """
         try:
             self._on_status("Looking for device...")
             self._on_progress(10)
 
-            dev = usb_device if usb_device is not None else self._usb_device
+            dev = usb_device if usb_device is not None else usb.core.find(
+                idVendor=VENDOR_ID, idProduct=PRODUCT_ID)
             if dev is None:
                 self._on_status("Device not found")
                 return False
@@ -132,6 +132,15 @@ class ConnectionManager:
                 self._on_status("Sending LED data...")
                 dev.write(0x02, SET_LED_DATA, 2000)
                 self._on_progress(90)
+
+
+
+
+
+
+
+
+
 
             self._on_status("USB initialization complete")
             return True
@@ -371,61 +380,14 @@ class ConnectionManager:
         except Exception as e:
             logger.debug("HID init via write failed (expected): %s", e)
 
-    def connect_hid(self, device_path: bytes) -> bool:
-        """Initialize only the verified USB peer of the selected HID path.
-
-        Native/Bluetooth HID and Windows HID-write fallback can still work when
-        libusb identity or permissions are unavailable; do not probe another
-        USB device in that case. Reopening a live session requires disconnect.
-        """
-        with self._session_lock:
-            if self.device is not None:
-                self._on_status("HID session is already open")
-                return False
-            if not device_path:
-                self._on_status("Select a HID device before connecting")
-                return False
-            try:
-                with _USB_COMMAND_LOCK:
-                    peer = self._resolve_usb_device(device_path)
-                    if peer is not None:
-                        self.initialize_via_usb(usb_device=peer)
-                    else:
-                        logger.info("USB initialization skipped: no verified peer for %r", device_path)
-            except Exception:
-                logger.debug("USB initialization unavailable for selected HID", exc_info=True)
-            return self.init_hid_device(device_path=device_path)
-
     def connect(self, usb_device=None, device_path: Optional[bytes] = None) -> bool:
-        """Compatibility entry point; an explicit HID target is mandatory.
+        """Full connection sequence: USB init then HID.
 
-        A supplied USB device must match the independently resolved HID peer.
-        This prevents pairing one controller's initialization with another's input.
+        Optionally target a specific USB device and/or HID device path.
         """
-        if usb_device is not None:
-            with _USB_COMMAND_LOCK:
-                peer = self._resolve_usb_device(device_path)
-                if peer is None or (peer.bus, peer.address) != (usb_device.bus, usb_device.address):
-                    self._on_status("USB device does not match selected HID path")
-                    return False
-        return self.connect_hid(device_path)
-
-    def transfer_to(self, destination) -> bool:
-        """Move an idle reader's complete session without rediscovery or close.
-
-        The caller must stop input/output first. Lock in a stable order so two
-        simultaneous transfers cannot deadlock or overwrite a live destination.
-        """
-        if destination is self:
+        if not self.initialize_via_usb(usb_device=usb_device):
             return False
-        first, second = sorted((self, destination), key=id)
-        with first._session_lock, second._session_lock:
-            if self.device is None or destination.device is not None:
-                return False
-            destination.device, self.device = self.device, None
-            destination.device_path, self.device_path = self.device_path, None
-            destination._usb_device, self._usb_device = self._usb_device, None
-            return True
+        return self.init_hid_device(device_path=device_path)
 
     def send_rumble(self, state: bool) -> bool:
         """Send rumble only to this session's verified USB peer.

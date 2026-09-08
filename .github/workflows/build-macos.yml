@@ -25,9 +25,6 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller gc_controller_enabler.spec
 
-      - name: Validate frozen application
-        run: python tools/check_frozen.py dist/NSO-GameCube-Controller-Pairing-App.app/Contents/MacOS/NSO-GameCube-Controller-Pairing-App
-
       - name: Zip macOS app bundle
         run: cd dist && zip -r NSO-GameCube-Controller-Pairing-App-macOS.zip NSO-GameCube-Controller-Pairing-App.app
 

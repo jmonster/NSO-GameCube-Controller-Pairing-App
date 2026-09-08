@@ -48,7 +48,7 @@ For any USB Bluetooth adapter, plug it into the front of your computer, not the 
 
 ## Requirements
 
-- Python 3.12+
+- Python 3.7+
 - Platform-specific dependencies (see below)
 
 ## Installation

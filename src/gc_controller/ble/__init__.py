@@ -6,6 +6,7 @@ using Google Bumble on Linux, or Bleak on macOS/Windows.
 """
 
 import os
+import subprocess
 import sys
 
 
@@ -41,6 +42,36 @@ def get_ble_unavailable_reason() -> str:
             return "The 'bleak' package is not installed. Install with: pip install bleak"
         return ""
     return "BLE support is only available on Linux, macOS, and Windows."
+
+
+def stop_bluez() -> bool:
+    """Stop BlueZ bluetooth.service and bring down the HCI adapter.
+
+    Bumble uses raw HCI sockets which require exclusive access.
+    Returns True if BlueZ was stopped (or was already stopped).
+    """
+    try:
+        subprocess.run(
+            ['systemctl', 'stop', 'bluetooth.service'],
+            capture_output=True, timeout=10,
+        )
+    except Exception:
+        pass
+
+    # Find and bring down all HCI adapters
+    bt_dir = '/sys/class/bluetooth'
+    if os.path.isdir(bt_dir):
+        for entry in sorted(os.listdir(bt_dir)):
+            if entry.startswith('hci'):
+                try:
+                    subprocess.run(
+                        ['hciconfig', entry, 'down'],
+                        capture_output=True, timeout=5,
+                    )
+                except Exception:
+                    pass
+
+    return True
 
 
 def find_hci_adapter() -> int | None:

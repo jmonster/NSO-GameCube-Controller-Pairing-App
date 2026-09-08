@@ -2,8 +2,8 @@
 Bleak BLE Backend
 
 macOS/Windows BLE backend using the Bleak library.
-Verify the documented Nintendo service layout, subscribe to the input channel,
-and require a valid input report before publishing a ready connection.
+Approach modeled after nso-gc-bridge: scan all devices, try connecting to each,
+send handshake to identify the controller, then subscribe to notifications.
 
 The OS BLE stack handles SMP pairing, MTU negotiation, and encryption automatically.
 No elevated privileges needed.
@@ -26,12 +26,10 @@ from .sw2_protocol import (
     LED_MAP, build_led_cmd, translate_ble_native_to_usb,
 )
 
-from ..ble_identifiers import NINTENDO_COMPANY_ID as _NINTENDO_COMPANY_ID
-
 _logger = logging.getLogger(__name__)
-_SW2_SERVICE_UUID = 'ab7de9be-89fe-49ad-828f-118f09df7fd0'
-_CONTROL_SERVICE_UUID = '00c5af5d-1964-4e30-8f51-1956f96bd280'
-_INPUT_READY_TIMEOUT = 5.0
+
+# Nintendo BLE manufacturer company ID (from protocol doc)
+_NINTENDO_COMPANY_ID = 0x037E
 
 # Known Nintendo controller name substrings
 _NINTENDO_NAME_PATTERNS = (
@@ -65,7 +63,7 @@ def _normalize_address(addr: str | None) -> str | None:
     """Strip /P or /R suffix from a BLE address (Linux Bumble format)."""
     if not addr:
         return addr
-    return re.sub(r'/[PR]$', '', addr.strip().upper())
+    return re.sub(r'/[PR]$', '', addr)
 
 
 # MAC address pattern: XX:XX:XX:XX:XX:XX
@@ -80,21 +78,15 @@ def _is_mac_address(addr: str) -> bool:
 class BleakBackend:
     """Manages BLE connections via Bleak (macOS/Windows).
 
-    A successful write is not readiness: the expected input channel must
-    deliver a correctly sized report, and every callback owns its client.
+    Follows the nso-gc-bridge approach: scan all devices, try connecting
+    to each, verify with a handshake write, then subscribe to notifications.
     """
 
     def __init__(self):
         self._clients: dict[str, BleakClient] = {}  # identifier -> BleakClient
         self._write_chars: dict[str, object] = {}   # identifier -> handshake char (command writes)
         self._cmd_chars: dict[str, object] = {}     # identifier -> command channel char (for vibration)
-        self._last_scan: dict[str, BLEDevice] = {}  # normalized address -> BLEDevice
-        self._pending = {}
-        self._cleanup_tasks = set()
-        self._conn_param_requests = {}
-        self._scanners = set()
-        self._closing = False
-        self.malformed_reports = 0
+        self._last_scan: dict[str, BLEDevice] = {}  # address -> BLEDevice from last scan_only()
 
     @property
     def is_open(self) -> bool:
@@ -102,7 +94,7 @@ class BleakBackend:
 
     async def open(self):
         """No-op — the OS BLE stack is always available in userspace."""
-        self._closing = False
+        pass
 
     @staticmethod
     def _log_connection_params(client: BleakClient, address: str):
@@ -151,8 +143,8 @@ class BleakBackend:
         # MAC from Linux will never match — discard it so we don't waste
         # time waiting for a match that can never happen.
         if target_address and sys.platform == 'darwin' and _is_mac_address(target_address):
-            on_status("Saved address belongs to another platform; select the controller again")
-            return None
+            _log(f"Discarding Linux MAC {target_address} (useless on macOS)")
+            target_address = None
 
         on_status("Scanning for controller...")
         _log(f"Scanning for {scan_timeout}s (target={target_address})...")
@@ -165,13 +157,12 @@ class BleakBackend:
         found_adv: dict[str, AdvertisementData] = {}
 
         def _on_detected(device: BLEDevice, adv: AdvertisementData):
-            found_devices[_normalize_address(device.address)] = device
-            found_adv[_normalize_address(device.address)] = adv
+            found_devices[device.address] = device
+            found_adv[device.address] = adv
 
         scanner = BleakScanner(detection_callback=_on_detected)
-        self._scanners.add(scanner)
+        await scanner.start()
         try:
-            await scanner.start()
             if target_address:
                 # Poll every 0.3s for the target instead of sleeping the full timeout
                 target_upper = target_address.upper()
@@ -186,10 +177,7 @@ class BleakBackend:
             else:
                 await asyncio.sleep(scan_timeout)
         finally:
-            try:
-                await scanner.stop()
-            finally:
-                self._scanners.discard(scanner)
+            await scanner.stop()
 
         # On Windows, bonded devices may not appear in scan results (WinRT
         # caches them separately).  If we have a target address that wasn't
@@ -227,10 +215,6 @@ class BleakBackend:
                 md = getattr(adv, 'manufacturer_data', {})
                 if _NINTENDO_COMPANY_ID in md:
                     return True
-                services = {uuid.lower() for uuid in getattr(adv, 'service_uuids', [])}
-                if services & {_SW2_SERVICE_UUID, _CONTROL_SERVICE_UUID}:
-                    return True
-                name = (getattr(adv, 'local_name', None) or d.name or "").lower()
             if name == "devicename" or any(
                     p.lower() in name for p in _NINTENDO_NAME_PATTERNS):
                 return True
@@ -241,7 +225,8 @@ class BleakBackend:
         # and causes false-positive handshakes on unrelated peripherals.
         candidates = [
             a for a in found_devices
-            if (a == target_address if target_address else _is_nintendo_like(a))
+            if _is_nintendo_like(a)
+            or (target_address and a.upper() == target_address.upper())
         ]
 
         if not candidates:
@@ -316,19 +301,13 @@ class BleakBackend:
         found_adv: dict[str, AdvertisementData] = {}
 
         def _on_detected(device: BLEDevice, adv: AdvertisementData):
-            found_devices[_normalize_address(device.address)] = device
-            found_adv[_normalize_address(device.address)] = adv
+            found_devices[device.address] = device
+            found_adv[device.address] = adv
 
         scanner = BleakScanner(detection_callback=_on_detected)
-        self._scanners.add(scanner)
-        try:
-            await scanner.start()
-            await asyncio.sleep(scan_timeout)
-        finally:
-            try:
-                await scanner.stop()
-            finally:
-                self._scanners.discard(scanner)
+        await scanner.start()
+        await asyncio.sleep(scan_timeout)
+        await scanner.stop()
 
         self._last_scan = dict(found_devices)
 
@@ -360,15 +339,12 @@ class BleakBackend:
         self._stream_adv: dict[str, AdvertisementData] = {}
         self._stream_seen: set[str] = set()
         self._stream_callback = on_device_found
-        scanner = None
 
         def _on_detected(device: BLEDevice, adv: AdvertisementData):
-            if self._active_scanner is not scanner:
-                return
             addr = device.address.upper()
             self._stream_devices[addr] = device
             self._stream_adv[addr] = adv
-            if self._active_scanner is not None:
+            if addr not in self._stream_seen:
                 self._stream_seen.add(addr)
                 rssi = adv.rssi if adv and adv.rssi is not None else -999
                 mfg = {}
@@ -385,19 +361,14 @@ class BleakBackend:
                     'service_uuids': svc_uuids,
                 })
 
-        scanner = self._active_scanner = BleakScanner(detection_callback=_on_detected)
-        try:
-            await self._active_scanner.start()
-        except BaseException:
-            await self.stop_scan()
-            raise
+        self._active_scanner = BleakScanner(detection_callback=_on_detected)
+        await self._active_scanner.start()
         _log("start_scan: scanner started")
 
     async def stop_scan(self):
         """Stop the continuous scan and cache results for connect_device."""
         scanner = getattr(self, '_active_scanner', None)
         if scanner is not None:
-            self._active_scanner = None
             try:
                 await scanner.stop()
             except Exception:
@@ -421,9 +392,18 @@ class BleakBackend:
         """
         address = _normalize_address(address) or address
 
-        if address in self._pending or address in self._clients:
-            on_status("Controller already has an active connection")
-            return None
+        # Clean up any stale connection to this address
+        old_client = self._clients.pop(address, None)
+        if old_client and old_client.is_connected:
+            _log(f"connect_device: disconnecting stale session for {address}")
+            on_status("Clearing previous connection...")
+            try:
+                await old_client.disconnect()
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        self._write_chars.pop(address, None)
+        self._cmd_chars.pop(address, None)
 
         ble_device = self._last_scan.get(address)
 
@@ -442,173 +422,231 @@ class BleakBackend:
             address, ble_device, slot_index, data_queue,
             on_status, on_disconnect, connect_timeout)
 
-    def _forget_client(self, address, client):
-        """Only the current client may remove address-keyed state."""
-        if self._clients.get(address) is not client:
-            return
-        self._clients.pop(address, None)
-        self._write_chars.pop(address, None)
-        self._cmd_chars.pop(address, None)
-        request = self._conn_param_requests.pop(address, None)
-        if request is not None:
-            try:
-                request.close()
-            except Exception:
-                _logger.debug("Failed to release connection parameter request", exc_info=True)
-
-    async def _disconnect_client(self, address, client):
-        self._forget_client(address, client)
-        try:
-            # Call even after a failed connect: Bleak may own partial OS state.
-            await asyncio.wait_for(client.disconnect(), 5)
-        except Exception:
-            _logger.debug("Client cleanup failed for %s", address, exc_info=True)
-
-    def _request_connection_parameters(self, address, client):
-        # Selective port of pookee/1b488872: retain the WinRT request for the
-        # connection's lifetime. Optimization remains optional, not readiness.
-        if sys.platform != 'win32':
-            return
-        # ThroughputOptimized can reduce concurrent-peripheral capacity (MSDN).
-        # Do not keep it active when pairing/using multiple controllers.
-        if len(self._clients) > 1:
-            for request in self._conn_param_requests.values():
-                try:
-                    request.close()
-                except Exception:
-                    _logger.debug("Connection request release failed", exc_info=True)
-            self._conn_param_requests.clear()
-            return
-        try:
-            if int(platform.version().split('.')[-1]) < 22000:
-                return
-            from winrt.windows.devices.bluetooth import BluetoothLEPreferredConnectionParameters
-            requester = getattr(getattr(client, '_backend', None), '_requester', None)
-            if requester is not None:
-                request = requester.request_preferred_connection_parameters(
-                    BluetoothLEPreferredConnectionParameters.throughput_optimized)
-                self._conn_param_requests[address] = request
-        except Exception:
-            _logger.debug("Optional WinRT connection tuning unavailable", exc_info=True)
-        # No undocumented CoreBluetooth selectors on macOS.
-
     async def _connect_and_init(
-        self, address, ble_device, slot_index, data_queue,
-        on_status, on_disconnect, connect_timeout,
-    ):
-        address = _normalize_address(address)
-        if self._closing or address in self._pending or address in self._clients:
-            return None
-        task = asyncio.current_task()
-        self._pending[address] = task
-        disconnected, input_received = asyncio.Event(), asyncio.Event()
-        ready = False
-        accepted = False
-        client = None
+        self,
+        address: str,
+        ble_device: Optional[object],
+        slot_index: int,
+        data_queue: queue.Queue,
+        on_status: Callable[[str], None],
+        on_disconnect: Callable[[], None],
+        connect_timeout: float,
+    ) -> Optional[str]:
+        """Try to connect to a device, handshake, and init.
 
-        def lost(owner):
-            nonlocal ready
+        Returns the address on success, None on failure.
+        """
+        disconnected = asyncio.Event()
+
+        def _on_disconnected(client: BleakClient):
+            _log(f"Disconnected from {address}")
             disconnected.set()
-            input_received.set()  # Wake initialization without a full timeout.
-            if self._clients.get(address) is not owner:
+            self._clients.pop(address, None)
+            self._write_chars.pop(address, None)
+            self._cmd_chars.pop(address, None)
+            on_disconnect()
+
+        # Connect — use BLEDevice object if available, else address string
+        try:
+            target = ble_device if ble_device is not None else address
+            client = BleakClient(target, timeout=connect_timeout,
+                                 disconnected_callback=_on_disconnected)
+            await client.connect()
+        except Exception as e:
+            _log(f"  Connect failed: {type(e).__name__}: {e}")
+            return None
+
+        if not client.is_connected:
+            _log(f"  Not connected after connect()")
+            return None
+
+        _log(f"  Connected to {address}")
+
+        # Log MTU
+        try:
+            _log(f"  MTU = {client.mtu_size}")
+        except Exception:
+            pass
+
+        # Request lower connection interval for reduced input latency.
+        if sys.platform == 'win32':
+            # Windows 10 defaults to 30-60ms intervals with no API to change them.
+            # Windows 11 (build 22000+) exposes ThroughputOptimized (~7.5-15ms).
+            try:
+                build_number = int(platform.version().split('.')[-1])
+                if build_number >= 22000:
+                    from bleak.backends.winrt.client import BleakClientWinRT
+                    from winrt.windows.devices.bluetooth import (
+                        BluetoothLEPreferredConnectionParameters,
+                    )
+                    backend = client._backend
+                    if isinstance(backend, BleakClientWinRT):
+                        backend._requester.request_preferred_connection_parameters(
+                            BluetoothLEPreferredConnectionParameters.throughput_optimized
+                        )
+                        _log("  Requested ThroughputOptimized connection parameters")
+                else:
+                    _log("  Windows 10 detected — cannot optimize BLE interval "
+                         "(30-60ms default, upgrade to Win11 for ~7.5-15ms)")
+            except Exception as e:
+                _log(f"  Connection parameter optimization skipped: {e}")
+        elif sys.platform == 'darwin':
+            # macOS CoreBluetooth: no public API for connection parameters.
+            # CBCentralManager handles interval negotiation internally (~15-30ms
+            # typical). Log for diagnostic visibility.
+            try:
+                from bleak.backends.corebluetooth.client import BleakClientCoreBluetooth
+                backend = client._backend
+                if isinstance(backend, BleakClientCoreBluetooth):
+                    _log("  macOS: requesting low-latency connection parameters")
+                    try:
+                        cb_peripheral = backend._peripheral
+                        cb_central = backend._manager
+                        # CBCentralManager has no documented setConnectionLatency
+                        # but some macOS versions expose it via ObjC runtime.
+                        if hasattr(cb_central, 'setConnectionLatency_forPeripheral_'):
+                            cb_central.setConnectionLatency_forPeripheral_(0, cb_peripheral)
+                            _log("  macOS: set connection latency to LOW")
+                        else:
+                            _log("  macOS: setConnectionLatency not available "
+                                 "(interval managed by CoreBluetooth, typically ~15-30ms)")
+                    except Exception as e2:
+                        _log(f"  macOS: connection parameter request failed: {e2}")
+            except Exception as e:
+                _log(f"  macOS connection parameter optimization skipped: {e}")
+
+        # Log connection parameters for latency diagnostics
+        self._log_connection_params(client, address)
+
+        # Discover services and find write/notify characteristics
+        write_chars = []
+        notify_chars = []
+        for svc in client.services:
+            _log(f"  Service: {svc.uuid}")
+            for char in svc.characteristics:
+                props = getattr(char, "properties", []) or []
+                _log(f"    0x{char.handle:04X} {char.uuid} props={props}")
+                if "notify" in props or "indicate" in props:
+                    notify_chars.append(char)
+                if "write" in props or "write-without-response" in props:
+                    write_chars.append(char)
+
+        if not write_chars:
+            _log(f"  No write characteristics — not a controller")
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            return None
+
+        # Try handshake: write SPI read command to each write characteristic
+        handshake_char = None
+        for char in write_chars:
+            try:
+                await client.write_gatt_char(char.uuid, _HANDSHAKE_CMD)
+                handshake_char = char
+                _log(f"  Handshake accepted on {char.uuid}")
+                break
+            except Exception:
+                try:
+                    # Fallback handshake
+                    await client.write_gatt_char(char.uuid, bytearray([0x01, 0x01]))
+                    handshake_char = char
+                    _log(f"  Fallback handshake accepted on {char.uuid}")
+                    break
+                except Exception:
+                    pass
+
+        if handshake_char is None:
+            _log(f"  Handshake failed on all chars — not the controller")
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            return None
+
+        self._clients[address] = client
+        self._write_chars[address] = handshake_char
+
+        # Identify the command channel for vibration commands.
+        # The Nintendo SW2 service has 3 WriteNoResp characteristics:
+        #   1st (lowest handle): Vibration/rumble output (0x0012)
+        #   2nd: Command channel (0x0014) — accepts SW2 commands like 0x0A
+        #   3rd (highest handle): Command + rumble prefix (0x0016)
+        # Find the service with ≥3 WriteNoResp chars, take the 2nd by handle.
+        for svc in client.services:
+            wnr = sorted(
+                [c for c in svc.characteristics
+                 if "write-without-response" in (getattr(c, "properties", []) or [])],
+                key=lambda c: c.handle)
+            if len(wnr) >= 3:
+                self._cmd_chars[address] = wnr[1]
+                _log(f"  Command channel: 0x{wnr[1].handle:04X} {wnr[1].uuid}")
+                break
+
+        if disconnected.is_set():
+            self._clients.pop(address, None)
+            self._write_chars.pop(address, None)
+            self._cmd_chars.pop(address, None)
+            return None
+
+        # Subscribe to all notify characteristics
+        on_status("Subscribing to input...")
+
+        _report_count = [0]
+
+        def _on_input(char: BleakGATTCharacteristic, value: bytearray):
+            # Ignore non-input notifications (e.g. command responses triggered
+            # by rumble writes).  BLE input reports are 63 bytes; command
+            # responses are shorter and would be misinterpreted as joystick
+            # data, corrupting both sticks while rumble is active.
+            if len(value) < 30:
                 return
-            self._forget_client(address, owner)
-            if ready:
-                ready = False
-                on_disconnect()
+            if _report_count[0] < 3:
+                _report_count[0] += 1
+                _log(f"  Report #{_report_count[0]}: len={len(value)} first16={list(value[:16])}")
+            try:
+                data_queue.put_nowait(translate_ble_native_to_usb(bytes(value)))
+            except queue.Full:
+                pass
+
+        for char in notify_chars:
+            try:
+                await client.start_notify(char.uuid, _on_input)
+                _log(f"  Subscribed to {char.uuid}")
+            except Exception as e:
+                _log(f"  Failed to subscribe to {char.uuid}: {e}")
+
+        # Send init commands (from nso-gc-bridge approach).
+        # SW2 protocol commands (like LED set) must go to the command channel
+        # characteristic (2nd WriteNoResp by handle = 0x0014 equivalent), not
+        # the handshake char.  Using the wrong characteristic causes the
+        # controller to silently ignore the command — this is why player LEDs
+        # didn't light up on macOS/Windows while working on Linux (Bumble
+        # writes directly to handle 0x0014).
+        cmd_char = self._cmd_chars.get(address, handshake_char)
+        for data in (_DEFAULT_REPORT_DATA, bytearray(build_led_cmd(
+                LED_MAP[min(slot_index, len(LED_MAP) - 1)]))):
+            try:
+                await client.write_gatt_char(cmd_char, data, response=False)
+            except Exception:
+                pass
 
         try:
-            client = BleakClient(ble_device if ble_device is not None else address,
-                                 timeout=connect_timeout, disconnected_callback=lost)
-            self._clients[address] = client
-            await client.connect()
-            if not client.is_connected or disconnected.is_set():
-                return None
-            self._request_connection_parameters(address, client)
-            self._log_connection_params(client, address)
+            await client.write_gatt_char(handshake_char.uuid, _SET_INPUT_MODE)
+        except Exception:
+            pass
 
-            services = list(client.services)
-            sw2 = [svc for svc in services if svc.uuid.lower() == _SW2_SERVICE_UUID]
-            if len(sw2) != 1:
-                raise ValueError("Unsupported Nintendo GATT service layout")
-            chars = list(sw2[0].characteristics)
-            inputs = sorted([c for c in chars if 'read' in c.properties and
-                             ('notify' in c.properties or 'indicate' in c.properties)],
-                            key=lambda c: c.handle)
-            writes = sorted([c for c in chars if 'write-without-response' in c.properties],
-                            key=lambda c: c.handle)
-            # NSO_GC_BLE_PROTOCOL.md: two input formats, three output channels.
-            # Resolve discovered objects, never UUID-only calls or fixed handles.
-            if len(inputs) != 2 or len(writes) != 3:
-                raise ValueError("Unsupported Nintendo input/output characteristics")
-            input_char, cmd_char = inputs[1], writes[1]
-            write_chars = [c for svc in services
-                           if svc.uuid.lower() in (_CONTROL_SERVICE_UUID, _SW2_SERVICE_UUID)
-                           for c in svc.characteristics
-                           if 'write' in c.properties or 'write-without-response' in c.properties]
-            handshake_char = None
-            for char in write_chars:
-                for command in (_HANDSHAKE_CMD, bytes((1, 1))):
-                    try:
-                        await client.write_gatt_char(char, command, response='write' in char.properties)
-                        handshake_char = char
-                        break
-                    except Exception:
-                        continue
-                if handshake_char is not None:
-                    break
-            if handshake_char is None:
-                raise ValueError("Controller initialization write failed")
+        _log(f"  Init complete for slot {slot_index}")
 
-            def input_report(sender, value):
-                if self._clients.get(address) is not client or disconnected.is_set():
-                    return
-                if sender.handle != input_char.handle or len(value) != 63:
-                    self.malformed_reports += 1
-                    return
-                try:
-                    data_queue.put_nowait(translate_ble_native_to_usb(bytes(value)))
-                except Exception:
-                    # Do not silently lose a release when the consumer stalls.
-                    lost(client)
-                    cleanup = asyncio.create_task(self._disconnect_client(address, client))
-                    self._cleanup_tasks.add(cleanup)
-                    cleanup.add_done_callback(self._cleanup_tasks.discard)
-                    return
-                input_received.set()
-
-            on_status("Subscribing to controller input...")
-            await client.start_notify(input_char, input_report)
-            for char, command in ((cmd_char, _DEFAULT_REPORT_DATA),
-                                  (cmd_char, build_led_cmd(LED_MAP[slot_index])),
-                                  (handshake_char, _SET_INPUT_MODE)):
-                try:
-                    await client.write_gatt_char(char, command, response='write' in char.properties)
-                except Exception:
-                    # Some firmware rejects redundant mode/LED writes. Actual
-                    # input is the acceptance criterion, not a write return value.
-                    _logger.debug("Optional initialization write rejected", exc_info=True)
-            on_status("Waiting for controller input...")
-            await asyncio.wait_for(input_received.wait(), _INPUT_READY_TIMEOUT)
-            if disconnected.is_set() or not client.is_connected:
-                return None
-            self._write_chars[address] = handshake_char
-            self._cmd_chars[address] = cmd_char
-            ready = accepted = True
-            on_status("Connected via BLE")
-            return address
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            on_status(f"Controller initialization failed: {str(exc) or type(exc).__name__}")
+        if disconnected.is_set():
+            self._clients.pop(address, None)
+            self._write_chars.pop(address, None)
+            self._cmd_chars.pop(address, None)
             return None
-        finally:
-            try:
-                if not accepted and client is not None:
-                    await self._disconnect_client(address, client)
-            finally:
-                if self._pending.get(address) is task:
-                    self._pending.pop(address, None)
+
+        on_status("Connected via BLE")
+        return address
 
     async def send_rumble(self, identifier: str, packet: bytes) -> bool:
         """Send vibration command via the SW2 command channel.
@@ -621,7 +659,6 @@ class BleakBackend:
         the full init.  The char object is used directly to avoid
         UUID/handle ambiguity.
         """
-        identifier = _normalize_address(identifier)
         client = self._clients.get(identifier)
         cmd_char = self._cmd_chars.get(identifier)
         if not client or not client.is_connected or not cmd_char:
@@ -643,7 +680,6 @@ class BleakBackend:
 
     async def set_led(self, identifier: str, slot_index: int) -> bool:
         """Update the player LED on a connected controller."""
-        identifier = _normalize_address(identifier)
         client = self._clients.get(identifier)
         cmd_char = self._cmd_chars.get(identifier)
         if not client or not client.is_connected or not cmd_char:
@@ -659,33 +695,17 @@ class BleakBackend:
             return False
 
     async def disconnect(self, identifier: str):
-        """Cancel an in-flight attempt before removing its owned client."""
-        identifier = _normalize_address(identifier)
-        task = self._pending.get(identifier)
-        if task is not None and task is not asyncio.current_task():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        client = self._clients.get(identifier)
-        if client is not None:
-            await self._disconnect_client(identifier, client)
+        """Disconnect a specific controller."""
+        self._write_chars.pop(identifier, None)
+        self._cmd_chars.pop(identifier, None)
+        client = self._clients.pop(identifier, None)
+        if client and client.is_connected:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
     async def close(self):
-        """Stop discovery and await every pending client cleanup."""
-        self._closing = True
-        try:
-            await self.stop_scan()
-            for scanner in list(self._scanners):
-                try:
-                    await scanner.stop()
-                finally:
-                    self._scanners.discard(scanner)
-        finally:
-            pending = [t for t in self._pending.values() if t is not asyncio.current_task()]
-            for task in pending:
-                task.cancel()
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
-            for address, client in list(self._clients.items()):
-                await self._disconnect_client(address, client)
-            if self._cleanup_tasks:
-                await asyncio.gather(*self._cleanup_tasks, return_exceptions=True)
+        """Disconnect all controllers."""
+        for identifier in list(self._clients.keys()):
+            await self.disconnect(identifier)

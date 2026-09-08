@@ -38,10 +38,7 @@ platform/macos/build.sh
 platform/windows/build.bat
 ```
 
-Run regression tests with `python -m unittest discover -s tests -v` and compile
-production modules with `python -m compileall -q src`. Tests use explicit
-hardware fakes and a real loopback UDP smoke test. See
-`docs/stabilization-validation.md` and `docs/fork-review.md` for limits and ports.
+There is no test suite in this project.
 
 ## Architecture
 
@@ -112,12 +109,12 @@ GUI (customtkinter) → App Orchestrator (app.py)
 
 ## Important Patterns
 
-- **Latency optimizations**: Blocking HID reads (no sleep), ordered BLE input delivery, delta-only button updates, lock-free calibration hot path, pre-allocated buffers (BLE protocol + DSU packets), binary IPC for BLE subprocess data, platform-specific BLE connection interval tuning
+- **Latency optimizations**: Blocking HID reads (no sleep), BLE queue draining, delta-only button updates, lock-free calibration hot path, pre-allocated buffers (BLE protocol + DSU packets), binary IPC for BLE subprocess data, platform-specific BLE connection interval tuning
 - **Thread safety**: Calibration modifications use locks; UI updates go through `root.after()` to stay on the Tkinter main thread
 - **Device claiming**: Path-based to prevent two slots from connecting to the same physical controller
 - **Report formats**: Standard GC USB binary format vs Windows NSO (report ID 0x05, different button encoding handled via `_translate_report_0x05()`) vs BLE (63-byte native Switch format)
 - **Platform detection**: Uses `sys.platform` throughout (`win32`, `linux`, `darwin`)
-- **BLE state**: Lazy initialization on first pair; shared child runtime, bounded ordered output, owning-session checks, and parent EOF retirement
+- **BLE state**: Lazy initialization on first pair; subprocess messaging via events/queues
 - **PyInstaller builds**: vgamepad DLL paths need special handling in frozen builds via `sys._MEIPASS`
 - **Entry points**: `--ble-subprocess` and `--bleak-subprocess` flags in `__main__.py` dispatch to BLE subprocess runners instead of the main app; `--latency` enables per-slot profiling output to stderr; `--minimized` starts in system tray (used by autostart)
 - **System tray**: Uses `pystray` with platform-specific backends (AppIndicator on Linux, native on macOS/Windows). Optional — gracefully disabled if unavailable.
@@ -145,14 +142,3 @@ Build: `pyinstaller`
 ## License
 
 GPLv3
-
-## Stabilization lifecycle invariants
-
-BLE IPC is version 2: wire slots have positive 64-bit generations, independent
-of UI player indices. Use `CommandTransport` / `SessionRouter` rather than direct
-pipe writes or hand-edited slot remaps. Keep parent and child versions together.
-Output creation is cancellable; a late factory completion must never publish
-into a stopped or replaced slot. USB initialization must target a verified
-selected device; never initialize every matching VID/PID as a reconnect shortcut.
-Settings must validate before mutation and rejected files must not be overwritten.
-See `docs/stabilization-validation.md` for automated versus manual release gates.
