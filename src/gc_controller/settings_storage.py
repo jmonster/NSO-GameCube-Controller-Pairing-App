@@ -71,7 +71,7 @@ def get_settings_dir(*, platform=None, home=None, environ=None, frozen=None, cwd
                     raise ValueError('Legacy settings must be a bounded regular file')
                 with open(legacy, 'rb') as stream:
                     payload = stream.read(MAX_LEGACY_BYTES + 1)
-                if len(payload) > MAX_LEGACY_BYTES or not isinstance(json.loads(payload), dict):
+                if len(payload) > MAX_LEGACY_BYTES or not isinstance(json.loads(payload.decode('utf-8')), dict):
                     raise ValueError('Legacy settings must contain a JSON object')
                 atomic_write(target, payload, overwrite=False)
                 _logger.info('Migrated settings from %s to %s; original retained', legacy, target)

@@ -62,7 +62,7 @@ class SettingsStorageTests(unittest.TestCase):
         self.assertFalse((directory / storage.SETTINGS_NAME).exists())
 
     def test_bad_legacy_json_is_not_published(self):
-        for payload in (b'not json', b'[]', b'\xff', b' ' * (storage.MAX_LEGACY_BYTES + 1)):
+        for payload in (b'not json', b'[]', b'\xff', '{}'.encode('utf-16'), b' ' * (storage.MAX_LEGACY_BYTES + 1)):
             self.legacy.write_bytes(payload)
             with self.assertLogs(storage._logger, 'WARNING'):
                 directory = self.directory(frozen=False)
