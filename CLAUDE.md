@@ -145,3 +145,14 @@ Build: `pyinstaller`
 ## License
 
 GPLv3
+
+## Stabilization lifecycle invariants
+
+BLE IPC is version 2: wire slots have positive 64-bit generations, independent
+of UI player indices. Use `CommandTransport` / `SessionRouter` rather than direct
+pipe writes or hand-edited slot remaps. Keep parent and child versions together.
+Output creation is cancellable; a late factory completion must never publish
+into a stopped or replaced slot. USB initialization must target a verified
+selected device; never initialize every matching VID/PID as a reconnect shortcut.
+Settings must validate before mutation and rejected files must not be overwritten.
+See `docs/stabilization-validation.md` for automated versus manual release gates.

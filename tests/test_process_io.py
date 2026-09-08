@@ -76,3 +76,16 @@ class StandardStreamsTests(unittest.TestCase):
         requirements = [line for line in (ROOT / 'requirements.txt').read_text().splitlines()
                         if line and not line.startswith('#')]
         self.assertEqual(requirements, ['.[build]'])
+
+
+class PackageChallengeTests(unittest.TestCase):
+    def test_fragmented_inherited_pipe_is_read_to_completion(self):
+        smoke = load_module('package_smoke.py')
+        parts = iter([bytes([i]) for i in range(256)])
+        stream = types.SimpleNamespace(read=lambda size: next(parts, b''))
+        self.assertEqual(smoke.read_challenge(stream), bytes(range(256)))
+
+    def test_eof_does_not_pad_a_truncated_challenge(self):
+        import io
+        smoke = load_module('package_smoke.py')
+        self.assertEqual(smoke.read_challenge(io.BytesIO(b'partial')), b'partial')

@@ -115,20 +115,92 @@ multiple WinRT connections; verify Bumble public host identity; and compare
 Dolphin partial trigger travel with digital clicks. Confirm denial/revocation
 of Bluetooth permission in the actual `.app`, not only source execution.
 
-## Remaining stabilization work
+## Checklist implementation follow-up
 
-The new failure handling is not a complete proof of all application lifetimes.
-Review pending virtual-gamepad creation versus Stop/Quit, UI/subprocess slot
-allocation across every reconnect path, parent command-pipe blocking, and
-application-level USB initialization loops. Strict settings value/schema
-validation, dependency lockfiles, full frozen-build smoke tests, signing and
-notarization remain outstanding. Linux BlueZ restoration and real USB driver
-reattachment still need release-level review and hardware testing.
+The following code paths now have regression coverage. These are implementation
+checks, not evidence of successful physical-controller or signed-app testing.
 
-The BLE IPC format has bounded validation and child/process ownership but no
-wire-level generation identifier; already-buffered events across every possible
-same-process slot reuse need additional end-to-end testing. No claim is made
-that every race or output failure is resolved.
+| Checklist item | Implementation and automated coverage |
+| --- | --- |
+| Pending output creation versus Stop/Quit | Emulation managers reserve a generation before calling a factory, cancel pending creation, reject stale publication/callbacks and dispose late results. GUI callbacks retain the owning slot and cancellation token. Headless output creation uses a cancellable worker instead of blocking BLE event handling while Dolphin is absent. |
+| Parent command-pipe blocking | A dedicated ordered writer owns each process pipe. Producers never block on OS writes; the queue is bounded to 128 frames / 64 KiB, with a two-second no-progress deadline. Failure retires only the owning child and schedules bounded process reaping. Real subprocess tests fill a pipe and exercise EOF. |
+| Buffered events across slot reuse | IPC version 2 carries a positive 64-bit generation on binary reports and slot-scoped JSON in both directions. Independent wire-slot allocation avoids conflating player reassignment with child slots. Parent callbacks revalidate ownership when dispatched, not just when read. Up to 256 initial reports are buffered in order until the consumer is bound; overflow is a service failure. Real child round-trip tests include reconnect and stale-generation events. |
+| USB initialization loops | Startup, auto-connect and headless paths initialize only the verified device associated with the selected HID path. Explicit USB initialization requires a device argument or established binding. Slot migration transfers the complete HID/feedback identity. USB-to-BLE migration requires an explicit saved device link, not arrival timing. |
+| Linux Bluetooth takeover/restoration | A single privileged lease snapshots the service and selected adapter, validates the adapter index, and checks every bounded command. Only the selected adapter is powered down. Cleanup restores the states this lease changed and reports failures; repeated restoration is safe. Mocked service/adapter failures and a real POSIX SIGTERM child test cover cleanup. |
+| Settings schema/value validation | Bounded UTF-8 JSON parsing rejects duplicate keys, non-finite values, invalid versions/types/ranges, malformed calibration, ambiguous normalized identifiers and invalid slots/links. Entire payloads validate before live mutation. Bad or future-format files remain intact and block automatic saving until a valid reload; source legacy migration applies the same validation. |
+| UI dispatcher memory growth and shutdown | The queue has a 1,024-callback count limit and a per-tick work limit. Overflow rejects further posts, discards stale work and invokes fail-safe shutdown on the Tk owner thread. Quit cancels pending starts, neutralizes outputs before reader waits, and attempts subsequent cleanup even when a callback or resource fails. |
+| Windows windowed subprocess streams | Missing Python standard streams are restored from duplicated inherited pipe handles. Required IPC never substitutes null streams for missing input/output. Binary mode preserves all 256 byte values. Tests run a real child and native pythonw on Windows. |
+
+### Compatibility and failure policy
+
+The parent and child must be upgraded together: protocol v2 deliberately rejects
+legacy input frames instead of interpreting them as a different session. A slot
+number alone is never authorization to deliver old input or feedback. Queue
+limits preserve bounded resource usage, not guaranteed delivery through a
+crashed or stalled process; exceeding them causes an explicit disconnect and
+neutralization rather than silently dropping a release. The dispatcher limit
+bounds callback count, not the byte size of arbitrary Python closures.
+
+Linux cleanup covers normal shutdown, EOF, handled failures and SIGTERM. It
+cannot execute after SIGKILL, kernel failure or power loss. The service remains
+inactive if it was inactive before takeover; an initially off adapter stays off.
+The lease prevents two helpers from simultaneously owning restoration. Actual
+systemd/BlueZ adapter behavior, privilege-policy interactions and recovery after
+forced termination still require hardware/OS acceptance tests.
+
+Strict settings validation is intentionally not a silent repair mechanism.
+Rejected files are preserved and automatic saves are blocked, avoiding the loss
+of unknown future-format settings or invalid calibration. Repair the retained
+file or restore a known-good backup, then reload/restart. Atomic replacement
+protects against partial normal writes but is not a universal power-loss or
+hostile-filesystem guarantee.
+
+## Frozen application smoke checks
+
+After building with the authoritative `requirements.txt` / `pyproject.toml`
+manifest, run the actual executable, not an import of the source checkout:
+
+```sh
+# macOS
+python tools/check_frozen.py dist/NSO-GameCube-Controller-Pairing-App.app/Contents/MacOS/NSO-GameCube-Controller-Pairing-App frozen-smoke.json
+# Windows
+python tools/check_frozen.py dist/NSO-GameCube-Controller-Pairing-App.exe frozen-smoke.json
+```
+
+The PR workflow builds macOS and Windows packages using Python 3.12 and runs the
+same diagnostic. It launches outside the build tree with an isolated home and
+without Python/library-path overrides; checks real backend imports, Tcl data,
+font/image resources, macOS bundled libusb and privacy declaration, and the
+Windows ViGEm client DLL; then exchanges every byte value through redirected
+pipes. It also starts the actual Bleak child for protocol-ready, open, shutdown
+and EOF, without scanning Bluetooth. Build diagnostics retain the resolved pip
+environment and warnings. The workflow neither installs the ViGEm driver nor
+signs, notarizes or releases an application.
+
+A successful smoke check does not establish GUI accessibility, OS privacy-prompt
+behavior, HID permissions, a working controller, or a clean-machine release.
+CI covers the architecture of each selected hosted runner, not every supported
+architecture or a universal macOS binary. The pinned Windows vgamepad source
+commit and unified manifest remove moving-source/manifest drift; transitive
+requirements are not yet a complete hash-locked reproducible environment.
+
+## Remaining stabilization and release gates
+
+- Exercise the complete manual matrix above, especially cancellation during real
+  pairing, controller reconnect after sleep, shared-hub feedback identity, driver
+  reattachment and actual Dolphin/DSU gameplay.
+- Run packaged macOS permission approval/denial/revocation and interactive
+  launch/restore/quit on clean supported Macs. Test each claimed architecture;
+  Developer ID signing, hardened runtime, notarization and distribution checks
+  remain outstanding and require real credentials and acceptance runs.
+- Move remaining synchronous USB enumeration/initialization and feedback work
+  off the GUI owner thread with a bounded, session-owned operation scheduler.
+  Device-scoped initialization fixes identity, not every hardware-call stall.
+- Review privileged helper trust boundaries and recovery after uncatchable
+  termination; verify service/power restoration on supported Linux systems.
+- Complete transitive dependency lockfiles, provenance/release verification and
+  broader end-to-end fault injection. Do not equate mock coverage or a package
+  import smoke check with a proof that every lifecycle race is eliminated.
 
 There is no native CoreHID backend, iOS/tvOS port, new signing identity, or
 notarization automation in this batch.

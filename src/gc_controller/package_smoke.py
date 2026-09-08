@@ -85,9 +85,20 @@ def inspect_package():
             'checked': checked, 'errors': errors}
 
 
+def read_challenge(stream):
+    """Raw inherited pipes may return short reads without reaching EOF."""
+    data = bytearray()
+    while len(data) < 256:
+        part = stream.read(256 - len(data))
+        if not part:
+            break
+        data.extend(part)
+    return bytes(data)
+
+
 def main():
     report = inspect_package()
-    challenge = sys.stdin.buffer.read(256)
+    challenge = read_challenge(sys.stdin.buffer)
     if challenge != bytes(range(256)):
         report['errors'].append({'check': 'stdin', 'error': 'Binary challenge was corrupted'})
     from gc_controller.ble.output import OutputWriter
