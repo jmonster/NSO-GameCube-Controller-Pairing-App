@@ -346,11 +346,15 @@ class BumbleBackend:
                 # This is discovery only, not proof of identity or readiness.
                 data = getattr(advertisement, 'data', None)
                 manufacturer = data.get(0xFF) if data is not None else None
-                if isinstance(manufacturer, (bytes, bytearray)) and len(manufacturer) >= 2:
-                    if int.from_bytes(manufacturer[:2], 'little') == NINTENDO_COMPANY_ID:
-                        found_mac[0] = addr_str
-                        found_event.set()
-                        return
+                company_id = None
+                if isinstance(manufacturer, tuple) and len(manufacturer) == 2:
+                    company_id = manufacturer[0]  # Bumble's decoded (company, data).
+                elif isinstance(manufacturer, (bytes, bytearray)) and len(manufacturer) >= 2:
+                    company_id = int.from_bytes(manufacturer[:2], 'little')
+                if company_id == NINTENDO_COMPANY_ID:
+                    found_mac[0] = addr_str
+                    found_event.set()
+                    return
                 for oui in _NINTENDO_OUIS:
                     if addr_str.startswith(oui):
                         found_mac[0] = addr_str

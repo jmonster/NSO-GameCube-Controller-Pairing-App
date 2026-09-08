@@ -193,7 +193,7 @@ class BumbleSessionTests(unittest.IsolatedAsyncioTestCase):
             for company, suffix in ((0x037E, '01'), (0x057E, '02'), (0x0553, '03')):
                 for callback in listeners:
                     callback(types.SimpleNamespace(address='AA:BB:CC:00:00:' + suffix,
-                        data={0xFF: company.to_bytes(2, 'little') + b'\x01'}))
+                        data={0xFF: (company, b'\x01')}))
         device = types.SimpleNamespace(on=lambda name, cb: listeners.append(cb),
             remove_listener=lambda name, cb: listeners.remove(cb),
             start_scanning=start, stop_scanning=AsyncMock())
