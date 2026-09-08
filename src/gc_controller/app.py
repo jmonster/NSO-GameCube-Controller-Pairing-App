@@ -2981,9 +2981,15 @@ class GCControllerEnabler:
 
     def run(self):
         """Start the application."""
-        if self._start_minimized and _TRAY_AVAILABLE and self._tray_icon:
-            self.root.withdraw()
-            self._tray_icon.visible = True
+        if self._start_minimized:
+            if _TRAY_AVAILABLE and self._tray_icon:
+                self.root.withdraw()
+                self._tray_icon.visible = True
+            else:
+                # macOS deliberately has no pystray event loop. Native
+                # minimization remains recoverable through the Dock/window
+                # manager, including when an optional tray backend fails.
+                self.root.iconify()
         self.root.mainloop()
 
 
