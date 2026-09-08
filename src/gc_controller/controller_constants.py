@@ -47,6 +47,9 @@ BUTTON_MAPPING = {
     'Dpad Right': GamepadButton.DPAD_RIGHT,
 }
 
+# Dolphin preserves trigger clicks separately from analog trigger travel.
+DOLPHIN_BUTTON_MAPPING = {**BUTTON_MAPPING, 'L': GamepadButton.L, 'R': GamepadButton.R}
+
 # Button definitions for HID data parsing
 BUTTONS = [
     ButtonInfo(3, 0x01, "B"),

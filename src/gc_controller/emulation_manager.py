@@ -13,7 +13,7 @@ import threading
 from typing import Optional, Dict
 
 from .virtual_gamepad import VirtualGamepad, create_gamepad
-from .controller_constants import BUTTON_MAPPING
+from .controller_constants import BUTTON_MAPPING, DOLPHIN_BUTTON_MAPPING
 from .calibration import CalibrationManager
 
 logger = logging.getLogger(__name__)
@@ -80,7 +80,8 @@ class EmulationManager:
 
             # Only emit press/release on state changes (delta updates)
             map_home = self._cal_mgr._calibration.get('map_home_to_guide', True)
-            for button_name, xbox_button in BUTTON_MAPPING.items():
+            mapping = DOLPHIN_BUTTON_MAPPING if self.mode == 'dolphin_pipe' else BUTTON_MAPPING
+            for button_name, xbox_button in mapping.items():
                 if button_name == 'Home' and not map_home:
                     # Ensure Guide is released if mapping was just disabled
                     if self._prev_buttons.get('Home', False):
@@ -99,12 +100,12 @@ class EmulationManager:
             l_pressed = button_states.get('L', False)
             r_pressed = button_states.get('R', False)
 
-            if l_pressed:
+            if l_pressed and self.mode != 'dolphin_pipe':
                 self.gamepad.left_trigger(255)
             else:
                 self.gamepad.left_trigger(left_trigger_calibrated)
 
-            if r_pressed:
+            if r_pressed and self.mode != 'dolphin_pipe':
                 self.gamepad.right_trigger(255)
             else:
                 self.gamepad.right_trigger(right_trigger_calibrated)
