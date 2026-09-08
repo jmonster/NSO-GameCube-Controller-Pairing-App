@@ -20,6 +20,7 @@ class BlueZLeaseTests(unittest.TestCase):
         self.up = True
         self.failure = None
         self.locked = False
+        self.journal = Mock(read=Mock(return_value=None))
 
     @contextmanager
     def lock(self):
@@ -46,7 +47,8 @@ class BlueZLeaseTests(unittest.TestCase):
 
     def lease(self, tool='btmgmt', run=None):
         return bluez.BlueZLease(2, run=self.run_command if run is None else run,
-                               lock_factory=self.lock, adapter_tool=tool)
+                               lock_factory=self.lock, adapter_tool=tool, resolve_tool=lambda name: name,
+                               journal=self.journal)
 
     def test_active_service_and_selected_adapter_are_restored(self):
         lease = self.lease()
@@ -130,7 +132,8 @@ class BlueZLeaseTests(unittest.TestCase):
         def busy():
             raise RuntimeError('already owned')
             yield
-        lease = bluez.BlueZLease(2, run=self.run_command, lock_factory=busy, adapter_tool='btmgmt')
+        lease = bluez.BlueZLease(2, run=self.run_command, lock_factory=busy, adapter_tool='btmgmt',
+                               resolve_tool=lambda name: name, journal=self.journal)
         with self.assertRaisesRegex(RuntimeError, 'already owned'): lease.acquire()
         self.assertEqual(self.calls, [])
 
