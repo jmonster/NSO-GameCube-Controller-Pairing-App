@@ -507,13 +507,8 @@ class GCControllerEnabler:
         target_info = available[0]
         target_path = target_info['path']
 
-        # Initialize all USB devices (send init data)
-        usb_devices = ConnectionManager.enumerate_usb_devices()
-        for usb_dev in usb_devices:
-            slot.conn_mgr.initialize_via_usb(usb_device=usb_dev)
-
         # Open specific HID device by path
-        if not slot.conn_mgr.init_hid_device(device_path=target_path):
+        if not slot.conn_mgr.connect_hid(device_path=target_path):
             return
 
         slot.device_path = target_path
@@ -1840,23 +1835,15 @@ class GCControllerEnabler:
         if not all_hid:
             return
 
-        # Initialize all USB devices first
-        usb_devices = ConnectionManager.enumerate_usb_devices()
-        for usb_dev in usb_devices:
-            tmp = ConnectionManager(
-                on_status=lambda msg: None,
-                on_progress=lambda val: None,
-            )
-            tmp.initialize_via_usb(usb_device=usb_dev)
-
-        claimed_paths: set = set()
-        claimed_slots: set = set()
+        claimed_paths = {s.conn_mgr.device_path for s in self.slots
+                         if s.is_connected and s.connection_mode == 'usb'}
+        claimed_slots = {i for i, s in enumerate(self.slots) if s.is_connected}
 
         def _do_connect(slot_idx, hid_info):
             path = hid_info['path']
             slot = self.slots[slot_idx]
             sui = self.ui.slots[slot_idx]
-            if slot.conn_mgr.init_hid_device(device_path=path):
+            if slot.conn_mgr.connect_hid(device_path=path):
                 claimed_paths.add(path)
                 claimed_slots.add(slot_idx)
                 slot.device_path = path
@@ -1995,14 +1982,6 @@ class GCControllerEnabler:
         if not unclaimed:
             return
 
-        usb_devices = ConnectionManager.enumerate_usb_devices()
-        for usb_dev in usb_devices:
-            tmp = ConnectionManager(
-                on_status=lambda msg: None,
-                on_progress=lambda val: None,
-            )
-            tmp.initialize_via_usb(usb_device=usb_dev)
-
         # Re-enumerate to get full HID info dicts for identity building
         all_hid = ConnectionManager.enumerate_devices()
         path_to_info = {d['path']: d for d in all_hid}
@@ -2017,7 +1996,7 @@ class GCControllerEnabler:
             slot = self.slots[slot_index]
             sui = self.ui.slots[slot_index]
 
-            if slot.conn_mgr.init_hid_device(device_path=path):
+            if slot.conn_mgr.connect_hid(device_path=path):
                 slot.device_path = path
                 slot.connection_mode = 'usb'
                 slot.device_identity = dev_id
@@ -2100,17 +2079,22 @@ class GCControllerEnabler:
     # ── Cross-transport migration ─────────────────────────────────
 
     def _try_cross_transport_migration(self, ble_slot: int):
-        """After BLE disconnects on ble_slot, check if a USB controller just
-        connected on another slot.  If so, it's likely the same physical
-        controller switching transport — migrate USB to the BLE slot and
-        auto-link the two identities.
+        """Move a known linked USB controller after BLE disconnects.
+
+        Mere connection timing does not establish identity in multiplayer.
+        Unknown USB/BLE pairs remain separate until the user links them.
         """
         now = time.monotonic()
         ble_identity = self.slots[ble_slot].device_identity
+        links = self.slot_calibrations[0].get('device_links', {})
+        if self.slots[ble_slot].is_connected or not ble_identity:
+            return
 
         best_usb_slot = None
         best_ts = 0.0
         for usb_slot, (ts, usb_id) in list(self._recent_usb_hotplug.items()):
+            if links.get(ble_identity) != usb_id and links.get(usb_id) != ble_identity:
+                continue
             if now - ts > 3.0:
                 self._recent_usb_hotplug.pop(usb_slot, None)
                 continue
@@ -2142,10 +2126,16 @@ class GCControllerEnabler:
         usb_slot_obj.input_proc.stop()
         usb_slot_obj.stop_emulation()
         saved_path = usb_slot_obj.device_path
-        saved_hid = usb_slot_obj.conn_mgr.device
+        target_slot = self.slots[ble_slot]
+        target_slot.input_proc.stop()
+        target_slot.stop_emulation()
+        if not usb_slot_obj.conn_mgr.transfer_to(target_slot.conn_mgr):
+            usb_slot_obj.input_proc.start()
+            if was_emulating:
+                self.toggle_emulation(usb_slot)
+            return
 
-        # Detach without closing the HID handle
-        usb_slot_obj.conn_mgr.device = None
+        # HID path and verified USB feedback move together, without closing.
         usb_slot_obj.device_path = None
         usb_slot_obj.device_identity = None
         usb_slot_obj.connection_mode = 'usb'
@@ -2160,7 +2150,6 @@ class GCControllerEnabler:
         target_slot = self.slots[ble_slot]
         target_sui = self.ui.slots[ble_slot]
 
-        target_slot.conn_mgr.device = saved_hid
         target_slot.device_path = saved_path
         target_slot.connection_mode = 'usb'
         target_slot.device_identity = usb_id
@@ -2262,11 +2251,7 @@ class GCControllerEnabler:
 
         if target_path:
             # Init all USB devices
-            usb_devices = ConnectionManager.enumerate_usb_devices()
-            for usb_dev in usb_devices:
-                slot.conn_mgr.initialize_via_usb(usb_device=usb_dev)
-
-            if slot.conn_mgr.init_hid_device(device_path=target_path):
+            if slot.conn_mgr.connect_hid(device_path=target_path):
                 slot.device_path = target_path
                 slot.connection_mode = 'usb'
                 # Rebuild identity from full HID info if available
@@ -3215,13 +3200,6 @@ def run_headless(mode_override: str = None):
         print("No GameCube controllers found and no BLE adapter available.")
         sys.exit(1)
 
-    # Initialize all USB devices
-    if all_hid:
-        usb_devices = ConnectionManager.enumerate_usb_devices()
-        for usb_dev in usb_devices:
-            tmp = ConnectionManager(on_status=lambda msg: None, on_progress=lambda val: None)
-            tmp.initialize_via_usb(usb_device=usb_dev)
-
     all_paths = {d['path'] for d in all_hid}
     active_slots: list[dict] = []
     claimed_paths = set()
@@ -3306,7 +3284,7 @@ def run_headless(mode_override: str = None):
             on_progress=lambda val: None,
         )
 
-        if not conn_mgr.init_hid_device(device_path=path):
+        if not conn_mgr.connect_hid(device_path=path):
             print(f"[slot {i + 1}] Failed to open HID device")
             return
 
@@ -3319,7 +3297,7 @@ def run_headless(mode_override: str = None):
         print(f"[slot {i + 1}] Starting {mode_label} emulation...")
         try:
             rumble_cb = _make_headless_rumble_cb(i, conn_mgr_ref=conn_mgr)
-            emu_mgr.start(slot_mode, slot_index=i, rumble_callback=rumble_cb)
+            emu_mgr.start(slot_mode, slot_index=i, rumble_callback=rumble_cb, cancel_event=stop_event)
             if slot_mode == 'dsu':
                 port = getattr(emu_mgr.gamepad, 'port', 26760)
                 print(f"[slot {i + 1}] DSU server on port {port}")
@@ -3514,7 +3492,7 @@ def run_headless(mode_override: str = None):
 
             try:
                 rumble_cb = _make_headless_rumble_cb(si)
-                emu_mgr.start(slot_mode, slot_index=si, rumble_callback=rumble_cb)
+                emu_mgr.start(slot_mode, slot_index=si, rumble_callback=rumble_cb, cancel_event=stop_event)
                 if slot_mode == 'dsu':
                     port = getattr(emu_mgr.gamepad, 'port', 26760)
                     print(f"[slot {si + 1}] DSU server on port {port}")
@@ -3733,11 +3711,7 @@ def run_headless(mode_override: str = None):
                             break
 
                 if target_path:
-                    usb_devs = ConnectionManager.enumerate_usb_devices()
-                    for usb_dev in usb_devs:
-                        conn_mgr.initialize_via_usb(usb_device=usb_dev)
-
-                    if conn_mgr.init_hid_device(device_path=target_path):
+                    if conn_mgr.connect_hid(device_path=target_path):
                         slot_info['device_path'] = target_path
                         input_proc.start()
                         print(f"[slot {idx + 1}] USB reconnected.")
@@ -3748,7 +3722,7 @@ def run_headless(mode_override: str = None):
                                 rumble_cb = _make_headless_rumble_cb(
                                     idx, conn_mgr_ref=conn_mgr)
                                 emu_mgr.start(slot_mode, slot_index=idx,
-                                              rumble_callback=rumble_cb)
+                                              rumble_callback=rumble_cb, cancel_event=stop_event)
                                 mode_label = {"dolphin_pipe": "Dolphin pipe", "dsu": "DSU server"}.get(slot_mode, "Xbox 360")
                                 print(f"[slot {idx + 1}] {mode_label} emulation resumed.")
                                 if slot_mode == 'dsu':
