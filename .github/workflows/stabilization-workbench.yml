@@ -37,7 +37,7 @@ jobs:
           shopt -s nullglob
           patches=(_stabilization/*.patch)
           if (( ${#patches[@]} )); then
-            git am "${patches[@]}"
+            git am --exclude='.github/workflows/*' "${patches[@]}"
             git rm -- "${patches[@]}"
             git commit -m 'chore: remove applied stabilization import files'
           fi
@@ -52,7 +52,9 @@ jobs:
           assert hashlib.sha256(payload).hexdigest() == expected, 'Patch checksum mismatch'
           Path('/tmp/stabilization.patch').write_bytes(payload)
           PY
-            git am /tmp/stabilization.patch
+            # Workflow files are published separately through the GitHub connector.
+            # The Actions token has contents permission, not workflows permission.
+            git am --exclude='.github/workflows/*' /tmp/stabilization.patch
             git rm -- _stabilization/batch.b64.* _stabilization/batch.sha256
             git commit -m 'chore: remove applied stabilization import files'
           fi
