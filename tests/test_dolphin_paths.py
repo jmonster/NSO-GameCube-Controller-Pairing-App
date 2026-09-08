@@ -48,7 +48,8 @@ class DolphinDirectoryTests(DolphinTestCase):
                                  [str(custom)])
 
     def test_override_expands_tilde_and_resolves_absolute_path(self):
-        os.environ.update(HOME=str(self.home), DOLPHIN_EMU_USERPATH='~/custom')
+        os.environ.update(HOME=str(self.home), USERPROFILE=str(self.home),
+                          DOLPHIN_EMU_USERPATH='~/custom')
         self.assertEqual(self.functions()['_get_all_dolphin_user_dirs'](),
                          [str(self.home / 'custom')])
 

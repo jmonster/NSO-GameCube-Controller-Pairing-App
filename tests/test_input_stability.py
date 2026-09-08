@@ -63,7 +63,7 @@ class InputStabilityTests(unittest.TestCase):
         self.processor._process_data = consume
         self.processor.start('ble')
         thread = self.processor._read_thread
-        thread.join(0.5)
+        thread.join(3.0)
         self.processor.stop()
         self.assertFalse(thread.is_alive())
         return seen

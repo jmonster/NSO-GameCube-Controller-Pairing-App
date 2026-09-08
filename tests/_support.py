@@ -45,8 +45,8 @@ def load_module(relative_path, fakes=None):
 def load_definitions(relative_path, names, namespace=None, class_name=None):
     """Compile selected production definitions without module startup effects.
 
-Used only for GUI entry points and build-spec literals, not for the input
-or connection engines. Bodies are read directly from production source.
+    GUI entry points and Dolphin path helpers are compiled directly from the
+    production source. Input and connection engines use load_module instead.
 """
     tree = ast.parse((SRC / relative_path).read_text(encoding='utf-8'))
     body = tree.body

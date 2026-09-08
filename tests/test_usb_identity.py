@@ -1,9 +1,10 @@
 """Device-specific USB feedback, including two controllers on one hub."""
 from pathlib import Path
 import plistlib
+import os
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest import TestCase
+from unittest import TestCase, skipIf
 from unittest.mock import Mock, patch
 
 from _support import load_definitions
@@ -180,6 +181,7 @@ class UsbRegistryTests(TestCase):
         with patch.object(self.module.subprocess, 'run', side_effect=OSError('unavailable')):
             self.assertEqual(self.module.ConnectionManager.build_hid_to_usb_address_map(), {})
 
+    @skipIf(os.name == 'nt', 'Symlink creation requires Windows privileges')
     def test_linux_follows_hidraw_ancestry(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
