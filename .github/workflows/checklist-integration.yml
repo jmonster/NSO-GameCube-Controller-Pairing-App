@@ -30,15 +30,25 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           python - <<'PY'
-          import base64, hashlib, json, lzma, pathlib, subprocess
+          import base64, hashlib, json, lzma, pathlib, re, subprocess
           for path in sorted(pathlib.Path('_stabilization').glob('*.json')):
               envelope = json.loads(path.read_text())
+              chunks = []
+              if 'parts' in envelope:
+                  names = envelope['parts']
+                  assert isinstance(names, list) and 0 < len(names) <= 16
+                  assert all(isinstance(n, str) and re.fullmatch(r'part-[0-9]+\.txt', n) for n in names)
+                  chunks = [path.parent / n for n in names]
+                  assert all(p.stat().st_size <= 128 * 1024 for p in chunks)
+                  payload = ''.join(p.read_text() for p in chunks)
+              else:
+                  payload = envelope['payload']
               decoder = lzma.LZMADecompressor(memlimit=64 * 1024 * 1024)
-              patch = decoder.decompress(base64.b64decode(envelope['payload'], validate=True), max_length=5 * 1024 * 1024)
+              patch = decoder.decompress(base64.b64decode(payload, validate=True), max_length=5 * 1024 * 1024)
               assert decoder.eof and not decoder.unused_data, 'Invalid or oversized patch'
               assert hashlib.sha256(patch).hexdigest() == envelope['sha256'], 'Checksum mismatch'
               subprocess.run(['git', 'am', '--exclude=.github/workflows/*'], input=patch, check=True)
-              subprocess.run(['git', 'rm', '--', str(path)], check=True)
+              subprocess.run(['git', 'rm', '--', str(path), *map(str, chunks)], check=True)
           PY
           python -m unittest discover -s tests -v
           python -m compileall -q src
