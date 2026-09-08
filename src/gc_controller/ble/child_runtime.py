@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import queue
+import signal
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -209,9 +210,14 @@ class ChildRunner:
         if action in ('close', 'shutdown'):
             return False
         if action == 'stop_bluez':
-            if self.stop_bluez is not None:
-                await asyncio.to_thread(self.stop_bluez)
-            self.output.event({'e': 'bluez_stopped'})
+            try:
+                if self.stop_bluez is not None:
+                    result = await asyncio.to_thread(self.stop_bluez)
+                    if result is not True:
+                        raise RuntimeError('Bluetooth takeover did not succeed')
+                self.output.event({'e': 'bluez_stopped'})
+            except Exception as exc:
+                self.output.event({'e': 'error', 'ctx': 'stop_bluez', 'msg': str(exc)})
         elif action == 'open':
             try:
                 if self.open_backend is not None:
@@ -292,8 +298,8 @@ class ChildRunner:
                 await self._stop_scan()
             finally:
                 try:
-                    for slot in list(self.sessions):
-                        await self._retire(slot)
+                    await asyncio.gather(*(self._retire(slot) for slot in list(self.sessions)),
+                                         return_exceptions=True)
                 finally:
                     await asyncio.wait_for(self.backend.close(), 5)
 
@@ -334,9 +340,25 @@ def run_subprocess(backend, *, open_backend=None, stop_bluez=None):
     output = OutputWriter(sys.stdout.buffer.fileno(), stop)
     runner = ChildRunner(backend, output, open_backend=open_backend, stop_bluez=stop_bluez)
     threading.Thread(target=read_commands, name='ble-commands', daemon=True).start()
+    async def serve():
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        old_handler = None
+        installed = False
+        if sys.platform != 'win32' and threading.current_thread() is threading.main_thread():
+            old_handler = signal.getsignal(signal.SIGTERM)
+            signal.signal(signal.SIGTERM,
+                          lambda *_: loop.call_soon_threadsafe(task.cancel))
+            installed = True
+        try:
+            await runner.run(commands)
+        finally:
+            if installed:
+                signal.signal(signal.SIGTERM, old_handler)
+
     try:
-        asyncio.run(runner.run(commands))
-    except KeyboardInterrupt:
+        asyncio.run(serve())
+    except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     except Exception as exc:
         print(f'BLE subprocess failed: {exc}', file=sys.stderr, flush=True)

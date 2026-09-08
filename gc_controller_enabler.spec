@@ -228,6 +228,7 @@ elif sys.platform == "linux":
         'bumble.gatt',
         'gc_controller.ble',
         'gc_controller.ble.bumble_backend',
+        'gc_controller.ble.bluez',
         'gc_controller.ble.ble_subprocess',
         'gc_controller.ble.sw2_protocol',
         # pystray AppIndicator backend (requires python3-gi + gir1.2-appindicator3-0.1)

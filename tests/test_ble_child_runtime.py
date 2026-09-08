@@ -154,6 +154,24 @@ class ChildSessionTests(unittest.IsolatedAsyncioTestCase):
         for slot in list(self.runner.sessions):
             await self.runner._retire(slot)
 
+    async def test_failed_bluez_takeover_cannot_publish_success(self):
+        for result in (False, None):
+            with self.subTest(result=result):
+                self.output.messages.clear()
+                self.runner.stop_bluez = lambda: result
+                await self.runner.command({'cmd': 'stop_bluez'})
+                self.assertEqual([m['e'] for m in self.output.messages], ['error'])
+                self.assertEqual(self.output.messages[0]['ctx'], 'stop_bluez')
+        def fail():
+            raise RuntimeError('permission denied')
+        self.output.messages.clear()
+        self.runner.stop_bluez = fail
+        await self.runner.command({'cmd': 'stop_bluez'})
+        self.assertIn('permission denied', self.output.messages[0]['msg'])
+        self.runner.stop_bluez = lambda: True
+        await self.runner.command({'cmd': 'stop_bluez'})
+        self.assertEqual(self.output.messages[-1], {'e': 'bluez_stopped'})
+
     async def connect(self, address='first', slot=0):
         await self.runner.command({'cmd': 'connect_device', 'slot_index': slot, 'address': address})
         session = self.runner.sessions[slot]

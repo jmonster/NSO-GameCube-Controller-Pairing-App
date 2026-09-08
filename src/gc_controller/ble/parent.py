@@ -5,6 +5,8 @@ import threading
 from .output import OutputWriter
 
 logger = logging.getLogger(__name__)
+_live = set()
+_live_lock = threading.Lock()
 
 
 class CommandTransport:
@@ -16,7 +18,7 @@ class CommandTransport:
     """
 
     def __init__(self, process, on_failure, *, write_timeout=2.0,
-                 grace_timeout=5.0, terminate_timeout=5.0, write=None,
+                 grace_timeout=5.0, terminate_timeout=25.0, write=None,
                  max_frames=128, max_bytes=64 * 1024):
         self.process = process
         self._on_failure = on_failure
@@ -30,6 +32,8 @@ class CommandTransport:
             process.stdin.fileno(), self._failed_write, write=write,
             max_frames=max_frames, max_bytes=max_bytes,
             write_timeout=write_timeout, on_close=process.stdin.close)
+        with _live_lock:
+            _live.add(self)
 
     def _failed_write(self, error):
         with self._lock:
@@ -38,6 +42,8 @@ class CommandTransport:
             self._failed = True
         try:
             self._on_failure(self.process, str(error))
+        except Exception:
+            logger.exception('BLE command failure handler failed')
         finally:
             # EOF alone cannot unblock a stuck write. Reap this exact child,
             # even if the UI is shutting down and no longer accepts callbacks.
@@ -69,6 +75,16 @@ class CommandTransport:
             self._done.wait(self._grace_timeout + self._terminate_timeout + 4)
         return self._done.is_set()
 
+    @staticmethod
+    def close_all():
+        """Final application exit must also await previously retired helpers."""
+        with _live_lock:
+            transports = list(_live)
+        for transport in transports:
+            transport.close()
+        for transport in transports:
+            transport.close(wait=True)
+
     def _reap(self):
         try:
             try:
@@ -85,3 +101,5 @@ class CommandTransport:
         finally:
             self._writer.close(0.5)
             self._done.set()
+            with _live_lock:
+                _live.discard(self)

@@ -45,23 +45,44 @@ def main():
             if path and path not in sys.path:
                 sys.path.insert(0, path)
     try:
-        from gc_controller.ble import stop_bluez, find_hci_adapter
+        from gc_controller.ble import find_hci_adapter
+        from gc_controller.ble.bluez import BlueZLease
         from gc_controller.ble.bumble_backend import BumbleBackend
         from gc_controller.ble.child_runtime import run_subprocess
     except ImportError as exc:
         print(json.dumps({'e': 'error', 'ctx': 'import', 'msg': str(exc)}), flush=True)
         return 1
     backend = BumbleBackend()
+    lease = None
+
+    def acquire_bluez():
+        nonlocal lease
+        if lease is None:
+            index = find_hci_adapter()
+            if index is None:
+                raise RuntimeError('No Bluetooth HCI adapter found')
+            lease = BlueZLease(index)
+        return lease.acquire()
 
     async def open_backend(command):
-        index = command.get('hci_index')
-        if index is None:
-            index = find_hci_adapter()
-        if type(index) is not int or index < 0:
-            raise RuntimeError('No valid Bluetooth HCI adapter found')
+        if lease is None or not lease.is_acquired:
+            raise RuntimeError('Acquire Bluetooth ownership before opening HCI')
+        index = command.get('hci_index', lease.hci_index)
+        if type(index) is not int or index != lease.hci_index:
+            raise RuntimeError('Cannot open an adapter outside the Bluetooth lease')
         await backend.open(hci_index=index)
 
-    run_subprocess(backend, open_backend=open_backend, stop_bluez=stop_bluez)
+    try:
+        run_subprocess(backend, open_backend=open_backend, stop_bluez=acquire_bluez)
+    finally:
+        # run_subprocess/asyncio.run finishes backend and executor cleanup first,
+        # including a cancelled to_thread(acquire). Restore even after failures.
+        if lease is not None:
+            try:
+                lease.release()
+            except Exception as exc:
+                print(f'Bluetooth restoration failed: {exc}', file=sys.stderr, flush=True)
+                return 1
     return 0
 
 

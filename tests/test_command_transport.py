@@ -135,3 +135,32 @@ class CommandTransportTests(unittest.TestCase):
         obj._subprocess = object()
         method(obj, proc, 'stale error')
         callback.assert_not_called()
+
+    def test_observer_failure_does_not_prevent_reaping(self):
+        proc = self.fake_process(); proc.poll.return_value = 1
+        transport = parent.CommandTransport(proc, Mock(side_effect=RuntimeError('observer')))
+        with self.assertLogs(parent.logger, level='ERROR'):
+            self.assertFalse(transport.send({'cmd': 'open'}))
+        self.assertTrue(transport.close(wait=True))
+        self.assertNotIn(transport, parent._live)
+
+    def test_final_exit_awaits_previously_retired_helpers(self):
+        entered, release = threading.Event(), threading.Event()
+        proc = self.fake_process()
+        def wait(**kwargs):
+            entered.set()
+            release.wait(2)
+            return 0
+        proc.wait.side_effect = wait
+        transport = parent.CommandTransport(proc, Mock(), write=lambda fd, view: len(view))
+        transport.close()
+        self.assertTrue(entered.wait(1))
+        finished = threading.Event()
+        thread = threading.Thread(target=lambda: (parent.CommandTransport.close_all(), finished.set()))
+        thread.start()
+        try:
+            self.assertFalse(finished.wait(0.02))
+        finally:
+            release.set(); thread.join(2)
+        self.assertTrue(finished.is_set())
+        self.assertNotIn(transport, parent._live)

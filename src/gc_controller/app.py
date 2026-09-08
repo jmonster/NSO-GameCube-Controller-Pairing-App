@@ -2945,6 +2945,7 @@ class GCControllerEnabler:
         self._cleanup_ble()
         if transport is not None:
             transport.close(wait=True)
+        CommandTransport.close_all()
 
         self.root.destroy()
 
