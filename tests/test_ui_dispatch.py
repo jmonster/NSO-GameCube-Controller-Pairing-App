@@ -59,3 +59,43 @@ class DispatcherTests(unittest.TestCase):
         self.scheduled.pop(0)()
         callback.assert_not_called()
         self.assertEqual(self.root.after.call_count, 1)
+
+    def test_overflow_is_bounded_latched_and_handled_on_owner_thread(self):
+        self.dispatcher.close()
+        calls = []
+        def overflow():
+            self.assertEqual(threading.get_ident(), self.owner)
+            calls.append('overflow')
+        dispatcher = self.module.MainThreadDispatcher(self.root, max_pending=2, on_overflow=overflow)
+        scheduled = self.scheduled[-1]
+        callback = Mock()
+        self.assertTrue(dispatcher.post(callback))
+        self.assertTrue(dispatcher.post(callback))
+        results = []
+        worker = threading.Thread(target=lambda: results.append(dispatcher.post(callback)))
+        worker.start(); worker.join(2)
+        self.assertEqual(results, [False])
+        self.assertEqual(dispatcher._queue.qsize(), 2)
+        self.assertEqual(calls, [])
+        self.assertFalse(dispatcher.post(callback))
+        with self.assertLogs(self.module.logger, 'ERROR'):
+            scheduled()
+        self.assertEqual(calls, ['overflow'])
+        self.assertEqual(dispatcher._queue.qsize(), 0)
+        callback.assert_not_called()
+        scheduled()
+        self.assertEqual(calls, ['overflow'])
+        self.assertFalse(dispatcher.post(callback))
+
+    def test_explicit_shutdown_cancels_pending_overflow_notification(self):
+        callback = Mock()
+        dispatcher = self.module.MainThreadDispatcher(self.root, max_pending=1, on_overflow=callback)
+        scheduled = self.scheduled[-1]
+        dispatcher.post(Mock()); dispatcher.post(Mock())
+        dispatcher.close(); scheduled()
+        callback.assert_not_called()
+
+    def test_invalid_queue_limits_fail_before_scheduling(self):
+        for limit in (0, -1, True, '10', 2.5):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                self.module.MainThreadDispatcher(self.root, max_pending=limit)

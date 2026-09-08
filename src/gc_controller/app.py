@@ -157,7 +157,9 @@ class GCControllerEnabler:
         self.root.configure(fg_color="#535486")
         self.root.minsize(720, 540)
         self._set_window_icon()
-        self._ui_dispatcher = MainThreadDispatcher(self.root)
+        self._ui_dispatcher = MainThreadDispatcher(
+            self.root, on_overflow=lambda: self._actual_quit(
+                reason='Controller event processing fell behind. Outputs were stopped to avoid stale input. Restart the application.'))
 
         # Per-slot calibration dicts
         self.slot_calibrations = [dict(DEFAULT_CALIBRATION) for _ in range(MAX_SLOTS)]
@@ -2904,35 +2906,40 @@ class GCControllerEnabler:
                 return
         self._actual_quit()
 
-    def _actual_quit(self):
-        """Perform full application shutdown and destroy the window."""
-        self._ui_dispatcher.close()
-        # Stop USB hotplug polling
-        self._stop_usb_hotplug()
+    def _actual_quit(self, reason=None):
+        """Idempotent shutdown; one failing resource cannot skip the others."""
+        if getattr(self, '_shutdown_started', False):
+            return
+        self._shutdown_started = True
 
-        # Stop auto-scan loop
-        self._stop_auto_scan()
+        def attempt(callback):
+            try:
+                callback()
+            except Exception:
+                logger.exception('Application shutdown operation failed')
 
-        # Stop tray icon
-        self._cleanup_tray()
+        attempt(self._ui_dispatcher.close)
+        attempt(self._stop_usb_hotplug)
+        attempt(self._stop_auto_scan)
+        attempt(self._cleanup_tray)
+        for i, slot in enumerate(self.slots):
+            attempt(lambda i=i: self._reset_rumble(i))
+            # Neutralize output before waiting for a reader to finish.
+            attempt(slot.stop_emulation)
+            attempt(slot.input_proc.stop)
+            attempt(slot.conn_mgr.disconnect)
 
-        for i in range(MAX_SLOTS):
-            self._reset_rumble(i)
-            slot = self.slots[i]
-            slot.input_proc.stop()
-            slot.stop_emulation()
-            slot.conn_mgr.disconnect()
-
-        # EOF/shutdown requests cleanup; retain the owner for the final bounded
-        # join so a privileged child is not abandoned at interpreter exit.
         transport = self._ble_commands
-        self._send_ble_cmd({"cmd": "shutdown"})
-        self._cleanup_ble()
+        attempt(lambda: self._send_ble_cmd({'cmd': 'shutdown'}))
+        attempt(self._cleanup_ble)
         if transport is not None:
-            transport.close(wait=True)
-        CommandTransport.close_all()
-
-        self.root.destroy()
+            attempt(lambda: transport.close(wait=True))
+        attempt(CommandTransport.close_all)
+        try:
+            if reason:
+                self._messagebox.showerror('Controller service stopped', reason)
+        finally:
+            self.root.destroy()
 
     def _set_window_icon(self):
         """Set the window/taskbar icon across platforms."""
