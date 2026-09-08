@@ -2138,10 +2138,14 @@ class GCControllerEnabler:
         if usb_slot_obj.emu_mgr.is_emulating:
             usb_slot_obj.emu_mgr.stop()
         saved_path = usb_slot_obj.device_path
-        saved_hid = usb_slot_obj.conn_mgr.device
+        target_slot = self.slots[ble_slot]
+        if not usb_slot_obj.conn_mgr.transfer_to(target_slot.conn_mgr):
+            usb_slot_obj.input_proc.start()
+            if was_emulating:
+                self.toggle_emulation(usb_slot)
+            return
 
-        # Detach without closing the HID handle
-        usb_slot_obj.conn_mgr.device = None
+        # The complete HID/feedback session now belongs to the target slot.
         usb_slot_obj.device_path = None
         usb_slot_obj.device_identity = None
         usb_slot_obj.connection_mode = 'usb'
@@ -2153,10 +2157,8 @@ class GCControllerEnabler:
         self.ui.update_tab_status(usb_slot, connected=False, emulating=False)
 
         # Re-attach on the BLE slot
-        target_slot = self.slots[ble_slot]
         target_sui = self.ui.slots[ble_slot]
 
-        target_slot.conn_mgr.device = saved_hid
         target_slot.device_path = saved_path
         target_slot.connection_mode = 'usb'
         target_slot.device_identity = usb_id

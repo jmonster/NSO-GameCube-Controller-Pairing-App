@@ -389,6 +389,19 @@ class ConnectionManager:
             return False
         return self.init_hid_device(device_path=device_path)
 
+    def transfer_to(self, destination) -> bool:
+        """Move a stopped reader's HID handle and feedback binding together."""
+        if destination is self:
+            return False
+        first, second = sorted((self, destination), key=id)
+        with first._session_lock, second._session_lock:
+            if self.device is None or destination.device is not None:
+                return False
+            destination.device, self.device = self.device, None
+            destination.device_path, self.device_path = self.device_path, None
+            destination._usb_device, self._usb_device = self._usb_device, None
+            return True
+
     def send_rumble(self, state: bool) -> bool:
         """Send rumble only to this session's verified USB peer.
 
