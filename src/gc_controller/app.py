@@ -623,14 +623,19 @@ class GCControllerEnabler:
         self._ble_stderr_thread.start()
 
     def _send_ble_cmd(self, cmd: dict):
-        """Send a JSON-line command to the BLE subprocess."""
-        if self._ble_subprocess and self._ble_subprocess.poll() is None:
-            try:
-                line = json.dumps(cmd, separators=(',', ':')) + '\n'
-                self._ble_subprocess.stdin.write(line.encode('utf-8'))
-                self._ble_subprocess.stdin.flush()
-            except Exception:
-                pass
+        """Send to the captured child, surfacing a failed command pipe as loss."""
+        proc = self._ble_subprocess
+        if proc is None:
+            return
+        try:
+            if proc.poll() is not None:
+                raise ConnectionError('BLE subprocess has exited')
+            line = json.dumps(cmd, separators=(',', ':')) + '\n'
+            proc.stdin.write(line.encode('utf-8'))
+            proc.stdin.flush()
+        except Exception as exc:
+            self._call_on_ui_thread(self._ble_service_lost, proc,
+                                   f'BLE command transport failed: {exc}')
 
     def _wait_ble_init(self, timeout: float) -> dict | None:
         """Block until the next init event from the BLE subprocess."""
@@ -2396,6 +2401,7 @@ class GCControllerEnabler:
             self._send_ble_cmd({
                 "cmd": "rumble",
                 "slot_index": slot_index,
+                "address": slot.ble_address,
                 "data": base64.b64encode(packet).decode('ascii'),
             })
         elif slot.conn_mgr.device:

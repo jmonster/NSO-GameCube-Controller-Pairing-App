@@ -186,6 +186,17 @@ class ChildRunner:
                 _logger.error('BLE feedback failed: %s', task.exception())
         task.add_done_callback(done)
 
+    def _command_session(self, cmd):
+        """Feedback/disconnect addresses identify ownership after UI slot moves."""
+        address = cmd.get('address')
+        if address is None:
+            return self.sessions.get(cmd['slot_index'])
+        if not isinstance(address, str) or not address:
+            raise ValueError('Invalid BLE command address')
+        matches = [session for session in self.sessions.values()
+                   if _address(address) in (_address(session.identifier), _address(session.target))]
+        return matches[0] if len(matches) == 1 else None
+
     async def command(self, cmd):
         if not isinstance(cmd, dict) or not isinstance(cmd.get('cmd'), str):
             raise ValueError('Malformed BLE command')
@@ -229,6 +240,9 @@ class ChildRunner:
             session.task = asyncio.create_task(self._connect(session, action == 'connect_device', cmd))
         elif action in ('scan_devices', 'scan_start'):
             await self._stop_scan()
+            session = self.sessions.get(slot)
+            if session and not session.ready:
+                await self._retire(slot)
             token = self.scan_token = object()
             self.scan_task = asyncio.create_task(self._scan(slot, token, action == 'scan_start'))
         elif action == 'scan_stop':
@@ -239,9 +253,11 @@ class ChildRunner:
                     await self._retire(index)
             await self._stop_scan()
         elif action == 'disconnect':
-            await self._retire(slot)
+            session = self._command_session(cmd)
+            if session is not None:
+                await self._retire(session.slot)
         elif action in ('rumble', 'set_led'):
-            session = self.sessions.get(slot)
+            session = self._command_session(cmd)
             if session and session.ready and not session.disconnected:
                 if action == 'rumble':
                     data = base64.b64decode(cmd['data'], validate=True)

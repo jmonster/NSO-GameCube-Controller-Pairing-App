@@ -242,3 +242,34 @@ class ChildSessionTests(unittest.IsolatedAsyncioTestCase):
         await self.runner.run(commands)
         self.assertFalse(self.runner.sessions)
         self.backend.close.assert_awaited_once()
+
+    async def test_reassigned_ui_slot_feedback_uses_address_not_other_controller(self):
+        await self.connect('first', 0)
+        await self.connect('second', 1)
+        await self.runner.command({'cmd': 'rumble', 'slot_index': 1, 'address': 'FIRST',
+                                  'data': base64.b64encode(b'xyz').decode()})
+        await asyncio.sleep(0)
+        self.backend.send_rumble.assert_awaited_once_with('first', b'xyz')
+
+    async def test_reassigned_ui_slot_disconnect_retires_only_address_owner(self):
+        first = await self.connect('first', 0)
+        second = await self.connect('second', 1)
+        await self.runner.command({'cmd': 'disconnect', 'slot_index': 1, 'address': 'first'})
+        self.assertNotIn(0, self.runner.sessions)
+        self.assertIs(self.runner.sessions[1], second)
+        self.assertNotIn('disconnect:second', self.backend.cleanup)
+        await self.runner.command({'cmd': 'disconnect', 'slot_index': 1, 'address': 'first'})
+        self.assertIs(self.runner.sessions[1], second)
+
+    async def test_start_scan_awaits_pending_connection_but_keeps_ready_controller(self):
+        ready = await self.connect('ready', 1)
+        self.backend.gate = asyncio.Event()
+        self.backend.start_scan = AsyncMock()
+        await self.runner.command({'cmd': 'connect_device', 'slot_index': 0, 'address': 'pending'})
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        await self.runner.command({'cmd': 'scan_start', 'slot_index': 0})
+        await self.runner.scan_task
+        self.assertNotIn(0, self.runner.sessions)
+        self.assertIs(self.runner.sessions[1], ready)
+        self.assertIn('pending', self.backend.cleanup)
