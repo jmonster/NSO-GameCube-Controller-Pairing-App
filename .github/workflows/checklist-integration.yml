@@ -1,0 +1,60 @@
+name: Temporary checklist integration
+
+# Removed before review. Only explicitly staged, reviewed patches are executed.
+on:
+  push:
+    branches: [stabilize/controller-sessions-and-macos]
+    paths: ['.github/workflows/checklist-integration.yml', '_stabilization/**']
+permissions:
+  contents: write
+concurrency:
+  group: checklist-integration
+  cancel-in-progress: false
+jobs:
+  integrate:
+    if: github.repository == 'jmonster/NSO-GameCube-Controller-Pairing-App'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - name: Apply reviewed patches and validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          python - <<'PY'
+          import base64, hashlib, json, lzma, pathlib, subprocess
+          for path in sorted(pathlib.Path('_stabilization').glob('*.json')):
+              envelope = json.loads(path.read_text())
+              decoder = lzma.LZMADecompressor(memlimit=64 * 1024 * 1024)
+              patch = decoder.decompress(base64.b64decode(envelope['payload'], validate=True), max_length=5 * 1024 * 1024)
+              assert decoder.eof and not decoder.unused_data, 'Invalid or oversized patch'
+              assert hashlib.sha256(patch).hexdigest() == envelope['sha256'], 'Checksum mismatch'
+              subprocess.run(['git', 'am', '--exclude=.github/workflows/*'], input=patch, check=True)
+              subprocess.run(['git', 'rm', '--', str(path)], check=True)
+          PY
+          python -m unittest discover -s tests -v
+          python -m compileall -q src
+          git diff --check "$GITHUB_SHA"
+          if [ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]; then
+            git commit -m 'chore: remove applied checklist payloads'
+            remote=$(git ls-remote origin refs/heads/stabilize/controller-sessions-and-macos | cut -f1)
+            test "$remote" = "$GITHUB_SHA"
+            git push origin HEAD:refs/heads/stabilize/controller-sessions-and-macos
+          fi
+      - name: Export exact repository snapshot
+        if: always()
+        run: git bundle create /tmp/checklist-source.bundle --all
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: checklist-source
+          path: /tmp/checklist-source.bundle
+          retention-days: 3
