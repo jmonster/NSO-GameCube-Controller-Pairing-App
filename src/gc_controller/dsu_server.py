@@ -4,9 +4,10 @@ DSU (Cemuhook) Protocol Server + VirtualGamepad Implementation
 Provides a UDP-based input server compatible with Dolphin, Cemu, Yuzu, Ryujinx,
 and other emulators that support the cemuhook DSU protocol.
 
-Protocol reference: https://v1993.github.io/cemern-protocol/
+Protocol reference: https://v1993.github.io/cemuhook-protocol/
 """
 
+import select
 import socket
 import struct
 import threading
@@ -97,6 +98,22 @@ def _build_port_info(server_id: int, slot: int, connected: bool) -> bytearray:
     return packet
 
 
+def _parse_request(data: bytes):
+    """Validate framing/CRC before any message-specific field access."""
+    if len(data) < HEADER_SIZE + 4 or data[:4] != DSUC_MAGIC:
+        return None
+    version, payload_length, expected_crc = struct.unpack_from('<HHI', data, 4)
+    size = HEADER_SIZE + payload_length
+    if version > DSU_PROTOCOL_VERSION or payload_length < 4 or len(data) < size:
+        return None
+    # The protocol permits trailing bytes; CRC covers the declared packet.
+    packet = bytearray(data[:size])
+    packet[8:12] = bytes(4)
+    if zlib.crc32(packet) & 0xFFFFFFFF != expected_crc:
+        return None
+    return struct.unpack_from('<I', packet, HEADER_SIZE)[0], data[:size]
+
+
 # ── DSUServer Singleton ─────────────────────────────────────────────
 
 _server_instance: Optional['DSUServer'] = None
@@ -109,8 +126,9 @@ def _acquire_server() -> 'DSUServer':
     global _server_instance, _server_refcount
     with _server_lock:
         if _server_instance is None:
-            _server_instance = DSUServer()
-            _server_instance.start()
+            candidate = DSUServer()
+            candidate.start()
+            _server_instance = candidate
         _server_refcount += 1
         return _server_instance
 
@@ -136,6 +154,7 @@ class DSUServer:
 
     BASE_PORT = 26760
     MAX_PORT_ATTEMPTS = 5
+    MAX_SUBSCRIPTIONS = 256
 
     def __init__(self):
         self._server_id = int(time.time()) & 0xFFFFFFFF
@@ -169,8 +188,8 @@ class DSUServer:
             self._packet_bufs.append(buf)
 
         # Subscribed clients: canonical dict under lock, snapshot for hot path
-        self._subscribers: dict[tuple, float] = {}
-        self._subscribers_snapshot: list[tuple] = []
+        self._subscribers: dict[tuple, float] = {}  # (client address, slot) -> expiry
+        self._subscribers_snapshot: tuple[tuple, ...] = ((), (), (), ())
         self._sub_lock = threading.Lock()
 
         # Per-slot rumble callbacks
@@ -209,42 +228,45 @@ class DSUServer:
         return self._port
 
     def start(self) -> None:
-        """Bind the UDP socket and start the listener thread."""
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-        for offset in range(self.MAX_PORT_ATTEMPTS):
-            port = self.BASE_PORT + offset
-            try:
-                self._sock.bind(('127.0.0.1', port))
-                self._port = port
-                break
-            except OSError:
-                continue
-        else:
-            raise RuntimeError(
-                f"Could not bind DSU server to any port in range "
-                f"{self.BASE_PORT}-{self.BASE_PORT + self.MAX_PORT_ATTEMPTS - 1}")
-
-        self._sock.settimeout(0.5)
-        self._running = True
-        self._thread = threading.Thread(target=self._listen_loop, daemon=True)
-        self._thread.start()
-        print(f"DSU server listening on 127.0.0.1:{self._port}")
+        """Bind loopback and publish the socket only after initialization succeeds."""
+        if self._running:
+            return
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            for offset in range(self.MAX_PORT_ATTEMPTS):
+                try:
+                    sock.bind(('127.0.0.1', self.BASE_PORT + offset))
+                    break
+                except OSError:
+                    continue
+            else:
+                raise RuntimeError('Could not bind a DSU loopback port')
+            # Port of pookee/1b48887: input threads must not wait for send buffers.
+            sock.setblocking(False)
+            self._port = sock.getsockname()[1]
+            self._sock = sock
+            self._running = True
+            self._thread = threading.Thread(target=self._listen_loop, daemon=True)
+            self._thread.start()
+        except BaseException:
+            self._running = False
+            self._sock = None
+            self._thread = None
+            sock.close()
+            raise
 
     def stop(self) -> None:
-        """Stop the listener thread and close the socket."""
+        """Close the socket and retire subscriptions before a future restart."""
         self._running = False
-        if self._thread:
-            self._thread.join(timeout=2.0)
-            self._thread = None
-        if self._sock:
-            try:
-                self._sock.close()
-            except Exception:
-                pass
-            self._sock = None
-        print("DSU server stopped.")
+        sock, self._sock = self._sock, None
+        if sock is not None:
+            sock.close()
+        thread, self._thread = self._thread, None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        with self._sub_lock:
+            self._subscribers.clear()
+            self._subscribers_snapshot = ((), (), (), ())
 
     def set_slot_connected(self, slot: int, connected: bool) -> None:
         """Mark a slot as connected/disconnected."""
@@ -260,93 +282,100 @@ class DSUServer:
     def update_slot(self, slot: int, state: dict) -> None:
         """Push new controller state for a slot and send to all subscribers."""
         self._slot_states[slot] = state
-        self._slot_packet_counter[slot] += 1
+        self._slot_packet_counter[slot] = (self._slot_packet_counter[slot] + 1) & 0xFFFFFFFF
         self._send_data_to_subscribers(slot)
 
     def _listen_loop(self) -> None:
-        """Main listener loop — handles incoming DSU client requests."""
-        seen_clients: set[tuple] = set()
-
+        """Prune even under continuous traffic; malformed requests cannot kill us."""
+        sock = self._sock
+        next_prune = time.monotonic() + 1.0
         while self._running:
-            try:
-                data, addr = self._sock.recvfrom(1024)
-            except socket.timeout:
+            now = time.monotonic()
+            if now >= next_prune:
                 self._prune_subscribers()
-                continue
-            except OSError:
-                if self._running:
+                next_prune = now + 1.0
+            try:
+                readable, _, _ = select.select([sock], [], [], 0.2)
+                if not readable:
                     continue
+                data, addr = sock.recvfrom(1024)
+            except (BlockingIOError, InterruptedError, ConnectionResetError, ConnectionRefusedError):
+                # Windows may surface an ICMP error when a UDP client exits.
+                # Losing one client must not disable the server for the others.
+                continue
+            except (OSError, ValueError):
                 break
+            self._handle_request(data, addr)
 
-            if len(data) < HEADER_SIZE:
-                continue
-            magic = data[0:4]
-            if magic != DSUC_MAGIC:
-                continue
+    def _reply(self, data, addr):
+        sock = self._sock
+        if sock is not None:
+            try:
+                sock.sendto(data, addr)
+            except OSError:
+                pass  # UDP/backpressure loss cannot stop the input or listener thread.
 
-            if addr not in seen_clients:
-                seen_clients.add(addr)
-                print(f"DSU: client connected from {addr[0]}:{addr[1]}")
-
-            msg_type = struct.unpack_from('<I', data, 16)[0] if len(data) > 16 else 0
-
-            if msg_type == MSG_TYPE_REQ_VERSION:
-                resp = _build_version_response(self._server_id)
-                self._sock.sendto(resp, addr)
-
-            elif msg_type == MSG_TYPE_REQ_PORTS:
-                self._handle_port_request(data, addr)
-
-            elif msg_type == MSG_TYPE_REQ_DATA:
-                self._handle_data_request(data, addr)
+    def _handle_request(self, data, addr):
+        parsed = _parse_request(data)
+        if parsed is None:
+            return
+        msg_type, data = parsed
+        if msg_type == MSG_TYPE_REQ_VERSION:
+            self._reply(_build_version_response(self._server_id), addr)
+        elif msg_type == MSG_TYPE_REQ_PORTS:
+            self._handle_port_request(data, addr)
+        elif msg_type == MSG_TYPE_REQ_DATA:
+            self._handle_data_request(data, addr)
 
     def _handle_port_request(self, data: bytes, addr: tuple) -> None:
-        """Respond to a port/controller info request."""
         if len(data) < 24:
             return
-        num_pads = struct.unpack_from('<I', data, 20)[0]
-        for i in range(min(num_pads, 4)):
-            if 24 + i < len(data):
-                slot = data[24 + i]
-                if 0 <= slot < 4:
-                    resp = _build_port_info(
-                        self._server_id, slot, self._slot_connected[slot])
-                    self._sock.sendto(resp, addr)
+        count = struct.unpack_from('<i', data, 20)[0]
+        if not 0 <= count <= 4 or len(data) < 24 + count:
+            return
+        for slot in data[24:24 + count]:
+            if 0 <= slot < 4:
+                self._reply(_build_port_info(self._server_id, slot,
+                                            self._slot_connected[slot]), addr)
+
+    def _refresh_subscribers(self):
+        self._subscribers_snapshot = tuple(
+            tuple(addr for addr, subscribed_slot in self._subscribers if subscribed_slot == slot)
+            for slot in range(4))
 
     def _handle_data_request(self, data: bytes, addr: tuple) -> None:
-        """Register a client subscription for pad data."""
-        with self._sub_lock:
-            self._subscribers[addr] = time.monotonic() + 5.0
-            self._subscribers_snapshot = list(self._subscribers.keys())
-
-    def _send_data_to_subscribers(self, slot: int) -> None:
-        """Build and send a pad data packet to all active subscribers.
-
-        Uses a snapshot of the subscriber list to avoid holding the lock
-        during packet build + sendto (the hot path).  Pruning happens
-        periodically from the listener thread via _prune_subscribers().
-        """
-        subs = self._subscribers_snapshot
-        if not subs or not self._sock:
+        if len(data) < 28 or data[20] & ~3:
             return
-
-        packet = self._build_data_packet(slot)
-        for addr in subs:
-            try:
-                self._sock.sendto(packet, addr)
-            except OSError:
-                pass
-
-    def _prune_subscribers(self) -> None:
-        """Remove expired subscribers and refresh the snapshot."""
+        flags, requested_slot = data[20:22]
+        mac = data[22:28]
         now = time.monotonic()
         with self._sub_lock:
-            expired = [a for a, exp in self._subscribers.items() if exp < now]
-            if not expired:
-                return
-            for a in expired:
-                del self._subscribers[a]
-            self._subscribers_snapshot = list(self._subscribers.keys())
+            # Expiry also runs here so stale entries cannot consume the cap.
+            self._subscribers = {key: expiry for key, expiry in self._subscribers.items()
+                                 if expiry > now}
+            for slot in range(4):
+                selected = (flags == 0 or flags & 1 and slot == requested_slot or
+                            flags & 2 and mac == bytes(5) + bytes([slot]))
+                key = (addr, slot)
+                if self._slot_connected[slot] and selected:
+                    if key in self._subscribers or len(self._subscribers) < self.MAX_SUBSCRIPTIONS:
+                        self._subscribers[key] = now + 5.0
+            self._refresh_subscribers()
+
+    def _send_data_to_subscribers(self, slot: int) -> None:
+        subs = self._subscribers_snapshot[slot]
+        if not subs or self._sock is None:
+            return
+        packet = self._build_data_packet(slot)
+        for addr in subs:
+            self._reply(packet, addr)
+
+    def _prune_subscribers(self) -> None:
+        now = time.monotonic()
+        with self._sub_lock:
+            self._subscribers = {key: expiry for key, expiry in self._subscribers.items()
+                                 if expiry > now}
+            self._refresh_subscribers()
 
     def _build_data_packet(self, slot: int) -> bytearray:
         """Build a pad data packet into the pre-allocated buffer for a slot.
