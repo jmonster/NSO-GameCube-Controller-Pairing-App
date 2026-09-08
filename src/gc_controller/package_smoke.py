@@ -23,6 +23,7 @@ def inspect_package():
 
     modules = ['hid', 'usb.core', 'customtkinter', 'tkinter', '_tkinter', 'PIL.Image',
                'gc_controller.connection_manager', 'gc_controller.emulation_manager',
+               'gc_controller.usb_worker',
                'gc_controller.controller_ui', 'gc_controller.ble.parent',
                'gc_controller.ble.sessions', 'gc_controller.ble.child_runtime']
     if sys.platform in ('darwin', 'win32'):

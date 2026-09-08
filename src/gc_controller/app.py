@@ -656,12 +656,15 @@ class GCControllerEnabler:
             )
         else:
             if frozen:
-                cmd = ['pkexec', sys.executable, '--ble-subprocess']
+                cmd = [shutil.which('pkexec', path='/usr/bin:/bin') or '/usr/bin/pkexec',
+                       sys.executable, '--ble-subprocess']
             else:
                 script_path = os.path.join(
                     os.path.dirname(__file__), 'ble', 'ble_subprocess.py')
-                python_path = os.pathsep.join(p for p in sys.path if p)
-                cmd = ['pkexec', sys.executable, script_path, python_path]
+                # Elevated source runs use only their interpreter environment
+                # and the helper's fixed package root, never arbitrary sys.path.
+                cmd = [shutil.which('pkexec', path='/usr/bin:/bin') or '/usr/bin/pkexec',
+                       sys.executable, '-I', os.path.abspath(script_path)]
             self._ble_subprocess = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -890,7 +893,7 @@ class GCControllerEnabler:
                 time.sleep(0.1)
             return self._ble_initialized
 
-        if sys.platform == 'linux' and not shutil.which('pkexec'):
+        if sys.platform == 'linux' and not shutil.which('pkexec', path='/usr/bin:/bin'):
             self._messagebox.showerror(
                 t("error.ble"), t("error.ble_pkexec"))
             return False
@@ -957,7 +960,7 @@ class GCControllerEnabler:
 
         Same as _init_ble() but without messagebox error dialogs (silent for auto-init).
         """
-        if sys.platform == 'linux' and not shutil.which('pkexec'):
+        if sys.platform == 'linux' and not shutil.which('pkexec', path='/usr/bin:/bin'):
             return False
 
         try:
@@ -2885,12 +2888,15 @@ class _BleHeadlessManager:
             )
         else:
             if frozen:
-                cmd = ['pkexec', sys.executable, '--ble-subprocess']
+                cmd = [shutil.which('pkexec', path='/usr/bin:/bin') or '/usr/bin/pkexec',
+                       sys.executable, '--ble-subprocess']
             else:
                 script_path = os.path.join(
                     os.path.dirname(__file__), 'ble', 'ble_subprocess.py')
-                python_path = os.pathsep.join(p for p in sys.path if p)
-                cmd = ['pkexec', sys.executable, script_path, python_path]
+                # Elevated source runs use only their interpreter environment
+                # and the helper's fixed package root, never arbitrary sys.path.
+                cmd = [shutil.which('pkexec', path='/usr/bin:/bin') or '/usr/bin/pkexec',
+                       sys.executable, '-I', os.path.abspath(script_path)]
             self._subprocess = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -2942,7 +2948,7 @@ class _BleHeadlessManager:
         if self._initialized:
             return True
 
-        if sys.platform == 'linux' and not shutil.which('pkexec'):
+        if sys.platform == 'linux' and not shutil.which('pkexec', path='/usr/bin:/bin'):
             print("BLE Error: pkexec is required for Bluetooth LE.")
             print("Install with: sudo apt install policykit-1")
             return False

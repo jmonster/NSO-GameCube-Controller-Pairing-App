@@ -157,8 +157,7 @@ hostile-filesystem guarantee.
 
 ## Frozen application smoke checks
 
-After building with the authoritative `requirements.txt` / `pyproject.toml`
-manifest, run the actual executable, not an import of the source checkout:
+After building with the native hash lock validated against `pyproject.toml`, run the actual executable, not an import of the source checkout:
 
 ```sh
 # macOS
@@ -167,7 +166,7 @@ python tools/check_frozen.py dist/NSO-GameCube-Controller-Pairing-App.app/Conten
 python tools/check_frozen.py dist/NSO-GameCube-Controller-Pairing-App.exe frozen-smoke.json
 ```
 
-The PR workflow builds macOS and Windows packages using Python 3.12 and runs the
+The PR workflow builds Linux, macOS and Windows packages using Python 3.12 and runs the
 same diagnostic. It launches outside the build tree with an isolated home and
 without Python/library-path overrides; checks real backend imports, Tcl data,
 font/image resources, macOS bundled libusb and privacy declaration, and the
@@ -179,28 +178,92 @@ signs, notarizes or releases an application.
 
 A successful smoke check does not establish GUI accessibility, OS privacy-prompt
 behavior, HID permissions, a working controller, or a clean-machine release.
-CI covers the architecture of each selected hosted runner, not every supported
-architecture or a universal macOS binary. The pinned Windows vgamepad source
-commit and unified manifest remove moving-source/manifest drift; transitive
-requirements are not yet a complete hash-locked reproducible environment.
+CI covers Linux x86_64, macOS arm64 and Windows x86_64 on Python 3.12. Other
+architectures/Python build versions fail without a matching reviewed lock.
+Python dependencies and build tools are hash locked; the OS image, compiler,
+SDK and system libusb are not. This is not a bit-reproducible-build claim.
+
+## USB scheduling and recovery implementation
+
+The GUI now uses a single discovery worker and at most four session workers.
+Enumeration, initialization, HID open/close, rumble and player LEDs do not run on
+the Tk thread. Cancelling an open immediately invalidates its UI result; the
+native worker retains its path/budget until cleanup finishes. Reconnection does
+not substitute an unrelated controller. Wire feedback holds only the most recent
+rumble and LED state, not an unbounded queue of obsolete effects. This coalescing
+applies to feedback only, never controller input/button transitions.
+
+A stuck native HID/libusb call cannot be forcibly cancelled safely in a Python
+thread. The worker count stays bounded and GUI shutdown waits only a shared
+budget, but a native operation still needs to return for full cleanup. Real
+unplug/sleep/wake tests remain required. Headless polling still uses synchronous
+USB calls and is not described as a nonblocking event-loop implementation.
+
+Linux management commands use validated root-owned executables from fixed system
+directories, a restricted environment, no interactive stdin, a fixed working
+directory and timeouts. The root-owned 0700 runtime directory holds a bounded,
+0600 recovery journal published before service/adapter mutations. Under the
+exclusive lease, a new helper first restores an interrupted record, including a
+previously selected different adapter. Malformed/unsafe journals stop takeover;
+restoration failures retain ownership and the record rather than claiming success.
+
+This recovers interrupted state on the NEXT helper start, not immediately after
+SIGKILL. /run is ephemeral across boots. It does not replace testing systemd,
+BlueZ, authentication policy and actual adapter behavior. Elevated source runs
+now use isolated Python and a fixed package root; they no longer accept a supplied
+import-path list. Source mode requires dependencies installed into that Python
+interpreter/venv. The authorized program/checkout and its dependencies still run
+with elevated privileges: a separately installed root-owned minimal broker is
+not implemented, and untrusted source trees must not be authorized with pkexec.
+
+## Dependency locks and release verification
+
+`requirements/locks` contains native Python 3.12 resolutions for Linux x86_64,
+macOS arm64 and Windows x86_64. Both runtime dependencies and the pip/setuptools/
+wheel/packaging/PyInstaller build tools are version- and archive-hash-pinned.
+The fixed vgamepad revision is fetched as a hash-verifiable source archive, not
+a moving branch or unhashed Git checkout. Bootstrap tools install first; source
+build isolation is disabled so pip cannot silently fetch unlocked build tools.
+
+```sh
+python tools/dependency_lock.py install --venv .build-venv
+# Use .build-venv/bin/python on POSIX or .build-venv/Scripts/python.exe on Windows.
+```
+
+The installer requires a fresh environment and matching manifest fingerprint;
+missing/mismatched locks do not fall back to latest versions. Regeneration is
+explicit through the manual candidate workflow or `generate` command, followed
+by review of versions, archive hashes and a clean native installation. Lock file
+line endings are fixed so Windows checkouts preserve verified bytes. The initial
+candidates were generated and clean-installed in run 34287249584.
+
+PR package tests and release builds share the same locked reusable workflow.
+Each platform builds and smoke-tests the actual executable, preserves package
+permissions/symlinks, and records source commit, dependency manifest digest,
+resolved versions, smoke result and archive checksum in a sidecar. These JSON
+sidecars are UNSIGNED integrity records, not proofs of a trustworthy publisher.
+The release gate requires exactly the three expected archives and sidecars,
+checks them against the expected source and committed locks, and generates
+SHA256SUMS. A tag-only step then creates GitHub/Sigstore attestations and verifies
+signatures against the exact repository, release workflow, source SHA and ref
+before publishing. No tag or actual signing/publishing run is performed as part
+of this PR; those event-specific steps still require a controlled release test.
+Developer ID signing/notarization of the macOS app is a separate requirement.
+
+References: pip secure installs and no-build-isolation documentation; polkit
+pkexec security notes; actions/attest v4.2.2 README; GitHub CLI attestation verify.
 
 ## Remaining stabilization and release gates
 
-- Exercise the complete manual matrix above, especially cancellation during real
-  pairing, controller reconnect after sleep, shared-hub feedback identity, driver
-  reattachment and actual Dolphin/DSU gameplay.
-- Run packaged macOS permission approval/denial/revocation and interactive
-  launch/restore/quit on clean supported Macs. Test each claimed architecture;
-  Developer ID signing, hardened runtime, notarization and distribution checks
-  remain outstanding and require real credentials and acceptance runs.
-- Move remaining synchronous USB enumeration/initialization and feedback work
-  off the GUI owner thread with a bounded, session-owned operation scheduler.
-  Device-scoped initialization fixes identity, not every hardware-call stall.
-- Review privileged helper trust boundaries and recovery after uncatchable
-  termination; verify service/power restoration on supported Linux systems.
-- Complete transitive dependency lockfiles, provenance/release verification and
-  broader end-to-end fault injection. Do not equate mock coverage or a package
-  import smoke check with a proof that every lifecycle race is eliminated.
+- Exercise the manual hardware matrix above, particularly unplug/sleep during
+  worker operations, four controllers, driver reattachment and emulator gameplay.
+- Verify interactive GUI behavior and packaged macOS privacy approval, denial,
+  revocation, minimized startup and quit on clean supported machines.
+- Test actual interrupted BlueZ recovery and root authorization; consider a
+  separately installed least-privilege broker before widening Linux deployment.
+- Run the tag-specific attestation/verification/publish gate deliberately after
+  hardware acceptance. OS/SDK/compiler pinning, additional architecture locks,
+  Developer ID signing, hardened runtime and notarization remain separate work.
 
-There is no native CoreHID backend, iOS/tvOS port, new signing identity, or
-notarization automation in this batch.
+There is no native CoreHID backend or iOS/tvOS port. Automated concurrency tests,
+locked installations and package smoke checks do not prove every hardware race.

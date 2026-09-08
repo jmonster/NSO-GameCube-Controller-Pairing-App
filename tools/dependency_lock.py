@@ -110,13 +110,16 @@ def generate(output):
                 'files': {name: digest((destination / name).read_bytes())
                           for name in ('requirements.lock', 'bootstrap.lock')},
                 'distributions': sorted(entries.values(), key=lambda item: item['name'])}
-    (destination / 'manifest.json').write_text(json.dumps(metadata, indent=2) + '\n', encoding='utf-8')
+    (destination / 'manifest.json').write_text(json.dumps(metadata, indent=2) + '\n', encoding='utf-8', newline='\n')
     print(f'Generated {destination}; this candidate must be reviewed and tested before publication.')
 
 
-def validate(directory, root=ROOT):
+def validate(directory, root=ROOT, *, expected_target=None):
+    if directory.is_symlink() or any((directory / name).is_symlink() for name in
+                                     ('manifest.json', 'bootstrap.lock', 'requirements.lock')):
+        raise ValueError('Dependency locks must be regular checked-in files')
     metadata = json.loads((directory / 'manifest.json').read_text(encoding='utf-8'))
-    if metadata.get('format') != 1 or metadata.get('target') != target():
+    if metadata.get('format') != 1 or metadata.get('target') != (target() if expected_target is None else expected_target):
         raise ValueError('Dependency lock does not match this Python/platform/architecture')
     if metadata.get('inputs_sha256') != fingerprint(root):
         raise ValueError('Dependency manifest changed; regenerate and review the native lock')
@@ -126,6 +129,12 @@ def validate(directory, root=ROOT):
         if digest((directory / name).read_bytes()) != expected:
             raise ValueError(f'Dependency lock checksum mismatch: {name}')
     distributions = metadata['distributions']
+    checked = entries_from_report({'install': [
+        {'metadata': {'name': entry['name'], 'version': entry['version']},
+         'download_info': {'url': entry['url'], 'archive_info': {'hashes': {'sha256': entry['sha256']}}},
+         'is_direct': ' @ ' in entry['requirement']} for entry in distributions]})
+    if sorted(checked.values(), key=lambda item: item['name']) != distributions:
+        raise ValueError('Noncanonical or unsafe dependency inventory')
     by_name = {entry['name']: entry for entry in distributions}
     if len(by_name) != len(distributions) or not BOOTSTRAP <= by_name.keys():
         raise ValueError('Invalid dependency inventory')

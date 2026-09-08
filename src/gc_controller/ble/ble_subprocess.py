@@ -11,11 +11,15 @@ import sys
 
 
 def main():
-    # Direct-script and frozen entrypoints both restore the application path.
-    if len(sys.argv) > 1:
-        for path in sys.argv[1].split(os.pathsep):
-            if path and path not in sys.path:
-                sys.path.insert(0, path)
+    # The parent uses isolated Python (-I) for elevated source execution.
+    # Never accept an arbitrary import search path as a command-line argument.
+    frozen = bool(getattr(sys, 'frozen', False))
+    expected = ['--ble-subprocess'] if frozen else []
+    if sys.argv[1:] != expected:
+        return 2
+    if not frozen:
+        package_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        sys.path.insert(0, package_root)
     from gc_controller.process_io import prepare_standard_streams
     prepare_standard_streams(ipc=True)
     try:
