@@ -26,16 +26,16 @@ class WriterTests(unittest.TestCase):
         errors = []
         writer = output_module.OutputWriter(123, errors.append, write=write)
         report = bytearray(64)
-        writer.event({'e': 'ready'})
-        writer.data(2, report)
+        writer.event({'e': 'ready', 'protocol': 2})
+        writer.data(2, report, 1)
         report[0] = 9
-        writer.event({'e': 'disconnected', 's': 2})
+        writer.event({'e': 'disconnected', 's': 2, 'g': 1})
         self.assertTrue(writer.close(2))
         events, data = [], []
         ipc = load_module('ble/ipc.py')
-        ipc.read_event_stream(io.BytesIO(result), lambda s, d: data.append((s, d)), events.append)
-        self.assertEqual(events, [{'e': 'ready'}, {'e': 'disconnected', 's': 2}])
-        self.assertEqual(data, [(2, bytes(64))])
+        ipc.read_event_stream(io.BytesIO(result), lambda s, g, d: data.append((s, g, d)), events.append)
+        self.assertEqual(events, [{'e': 'ready', 'protocol': 2}, {'e': 'disconnected', 's': 2, 'g': 1}])
+        self.assertEqual(data, [(2, 1, bytes(64))])
         self.assertEqual(errors, [])
 
     def test_stalled_writer_does_not_block_producers_or_close(self):
@@ -96,7 +96,7 @@ class WriterTests(unittest.TestCase):
             for slot, report in ((-1, bytes(64)), (4, bytes(64)), (True, bytes(64)),
                                  (0, bytes(63)), (0, bytes(65))):
                 with self.assertRaises(ValueError):
-                    writer.data(slot, report)
+                    writer.data(slot, report, 1)
         finally:
             writer.close()
 
@@ -108,8 +108,8 @@ class FakeOutput:
     def event(self, event):
         self.messages.append(event)
 
-    def data(self, slot, report):
-        self.messages.append({'data': bytes(report), 's': slot})
+    def data(self, slot, report, generation):
+        self.messages.append({'data': bytes(report), 's': slot, 'g': generation})
 
 
 class FakeBackend:
@@ -149,6 +149,19 @@ class ChildSessionTests(unittest.IsolatedAsyncioTestCase):
         self.backend, self.output = FakeBackend(), FakeOutput()
         self.runner = runtime.ChildRunner(self.backend, self.output)
 
+    async def command(self, cmd):
+        """Generate valid v2 commands for the pre-existing lifecycle scenarios."""
+        cmd = dict(cmd)
+        if cmd['cmd'] in {'connect_device', 'scan_connect', 'scan_start', 'scan_devices'}:
+            cmd.setdefault('g', self.runner._last_generation + 1)
+        elif cmd['cmd'] in {'disconnect', 'rumble', 'set_led'}:
+            wanted = runtime._address(cmd.get('address'))
+            session = next((s for s in self.runner.sessions.values()
+                            if (runtime._address(s.identifier) == wanted if wanted
+                                else s.slot == cmd.get('slot_index'))), None)
+            cmd.setdefault('g', session.generation if session else 1)
+        return await self.runner.command(cmd)
+
     async def asyncTearDown(self):
         await self.runner._stop_scan()
         for slot in list(self.runner.sessions):
@@ -159,21 +172,21 @@ class ChildSessionTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(result=result):
                 self.output.messages.clear()
                 self.runner.stop_bluez = lambda: result
-                await self.runner.command({'cmd': 'stop_bluez'})
+                await self.command({'cmd': 'stop_bluez'})
                 self.assertEqual([m['e'] for m in self.output.messages], ['error'])
                 self.assertEqual(self.output.messages[0]['ctx'], 'stop_bluez')
         def fail():
             raise RuntimeError('permission denied')
         self.output.messages.clear()
         self.runner.stop_bluez = fail
-        await self.runner.command({'cmd': 'stop_bluez'})
+        await self.command({'cmd': 'stop_bluez'})
         self.assertIn('permission denied', self.output.messages[0]['msg'])
         self.runner.stop_bluez = lambda: True
-        await self.runner.command({'cmd': 'stop_bluez'})
+        await self.command({'cmd': 'stop_bluez'})
         self.assertEqual(self.output.messages[-1], {'e': 'bluez_stopped'})
 
     async def connect(self, address='first', slot=0):
-        await self.runner.command({'cmd': 'connect_device', 'slot_index': slot, 'address': address})
+        await self.command({'cmd': 'connect_device', 'slot_index': slot, 'address': address})
         session = self.runner.sessions[slot]
         await session.task
         return session
@@ -181,7 +194,7 @@ class ChildSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_connected_event_precedes_initial_data(self):
         await self.connect()
         self.assertEqual(self.output.messages[0]['e'], 'connected')
-        self.assertEqual(self.output.messages[1], {'s': 0, 'data': bytes(64)})
+        self.assertEqual(self.output.messages[1], {'s': 0, 'g': 1, 'data': bytes(64)})
 
     async def test_stale_disconnect_status_and_data_cannot_affect_replacement(self):
         await self.connect('first')
@@ -202,7 +215,7 @@ class ChildSessionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancellation_finishes_before_replacement_starts(self):
         self.backend.gate = asyncio.Event()
-        await self.runner.command({'cmd': 'connect_device', 'slot_index': 0, 'address': 'first'})
+        await self.command({'cmd': 'connect_device', 'slot_index': 0, 'address': 'first'})
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         self.backend.gate = None
@@ -213,7 +226,7 @@ class ChildSessionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_duplicate_target_does_not_disconnect_other_slot(self):
         first = await self.connect('AA:BB:CC:DD:EE:FF/P')
-        await self.runner.command({'cmd': 'connect_device', 'slot_index': 1,
+        await self.command({'cmd': 'connect_device', 'slot_index': 1,
                                    'address': 'aa:bb:cc:dd:ee:ff'})
         self.assertIs(self.runner.sessions[0], first)
         self.assertNotIn(1, self.runner.sessions)
@@ -221,7 +234,7 @@ class ChildSessionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_all_scans_preserves_ready_connections(self):
         first = await self.connect()
-        await self.runner.command({'cmd': 'cancel_all_scans'})
+        await self.command({'cmd': 'cancel_all_scans'})
         self.assertIs(self.runner.sessions[0], first)
 
     async def test_eof_and_invalid_commands_always_close_backend(self):
@@ -248,7 +261,7 @@ class ChildSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_feedback_targets_owning_slot(self):
         await self.connect('first', 0)
         await self.connect('second', 1)
-        await self.runner.command({'cmd': 'rumble', 'slot_index': 1,
+        await self.command({'cmd': 'rumble', 'slot_index': 1,
                                    'data': base64.b64encode(b'xyz').decode()})
         await asyncio.sleep(0)
         self.backend.send_rumble.assert_awaited_once_with('second', b'xyz')
@@ -264,7 +277,7 @@ class ChildSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_reassigned_ui_slot_feedback_uses_address_not_other_controller(self):
         await self.connect('first', 0)
         await self.connect('second', 1)
-        await self.runner.command({'cmd': 'rumble', 'slot_index': 1, 'address': 'FIRST',
+        await self.command({'cmd': 'rumble', 'slot_index': 1, 'address': 'FIRST',
                                   'data': base64.b64encode(b'xyz').decode()})
         await asyncio.sleep(0)
         self.backend.send_rumble.assert_awaited_once_with('first', b'xyz')
@@ -272,21 +285,22 @@ class ChildSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_reassigned_ui_slot_disconnect_retires_only_address_owner(self):
         first = await self.connect('first', 0)
         second = await self.connect('second', 1)
-        await self.runner.command({'cmd': 'disconnect', 'slot_index': 1, 'address': 'first'})
+        await self.command({'cmd': 'disconnect', 'slot_index': 1, 'address': 'first'})
         self.assertNotIn(0, self.runner.sessions)
         self.assertIs(self.runner.sessions[1], second)
         self.assertNotIn('disconnect:second', self.backend.cleanup)
-        await self.runner.command({'cmd': 'disconnect', 'slot_index': 1, 'address': 'first'})
+        await self.command({'cmd': 'disconnect', 'slot_index': 1, 'address': 'first'})
         self.assertIs(self.runner.sessions[1], second)
 
-    async def test_start_scan_awaits_pending_connection_but_keeps_ready_controller(self):
+    async def test_cancel_then_start_scan_awaits_pending_connection_but_keeps_ready_controller(self):
         ready = await self.connect('ready', 1)
         self.backend.gate = asyncio.Event()
         self.backend.start_scan = AsyncMock()
-        await self.runner.command({'cmd': 'connect_device', 'slot_index': 0, 'address': 'pending'})
+        await self.command({'cmd': 'connect_device', 'slot_index': 0, 'address': 'pending'})
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        await self.runner.command({'cmd': 'scan_start', 'slot_index': 0})
+        await self.command({'cmd': 'cancel_all_scans'})
+        await self.command({'cmd': 'scan_start', 'slot_index': 0})
         await self.runner.scan_task
         self.assertNotIn(0, self.runner.sessions)
         self.assertIs(self.runner.sessions[1], ready)

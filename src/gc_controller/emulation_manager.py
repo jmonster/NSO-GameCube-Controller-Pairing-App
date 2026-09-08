@@ -161,3 +161,39 @@ class EmulationManager:
 
             except Exception as e:
                 print(f"Virtual controller update error: {e}")
+
+
+class OutputStart:
+    """Cancellable output creation for event-loop consumers such as headless BLE.
+
+    Publish this object to its owning slot before calling launch(). stop() may
+    then cancel a worker that has not started yet as well as a running factory.
+    on_complete receives the operation itself for stale-completion checks.
+    """
+    def __init__(self, manager, mode, slot_index, rumble_callback, on_complete):
+        self.manager = manager
+        self.mode = mode
+        self.slot_index = slot_index
+        self.rumble_callback = rumble_callback
+        self.on_complete = on_complete
+        self.cancel_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, name='controller-output-start', daemon=True)
+
+    def launch(self):
+        self.thread.start()
+
+    def stop(self):
+        self.cancel_event.set()
+        self.manager.stop()
+
+    def _run(self):
+        error = None
+        try:
+            self.manager.start(self.mode, slot_index=self.slot_index,
+                               cancel_event=self.cancel_event, rumble_callback=self.rumble_callback)
+        except Exception as exc:
+            error = str(exc)
+        try:
+            self.on_complete(self, error)
+        except Exception:
+            logger.exception('Output completion callback failed')

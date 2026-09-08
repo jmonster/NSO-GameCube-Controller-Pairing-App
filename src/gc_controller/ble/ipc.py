@@ -1,8 +1,15 @@
-"""Framing for the existing 66-byte BLE data / JSON-line subprocess protocol."""
+"""Version 2 framing: generation-tagged input and JSON-line events."""
 import json
+import struct
 
 MAX_JSON_BYTES = 64 * 1024
 MAX_SLOTS = 4
+PROTOCOL_VERSION = 2
+INPUT_HEADER = struct.Struct('>BQ')  # wire slot + unsigned 64-bit generation
+
+
+def valid_generation(value):
+    return type(value) is int and 0 < value < 2 ** 64
 
 
 class ProtocolError(ValueError):
@@ -32,10 +39,13 @@ def read_event_stream(stream, on_data, on_event):
         if not header:
             return
         if header == b'\xff':
-            packet = _read_exact(stream, 65)
-            if packet[0] >= MAX_SLOTS:
-                raise ProtocolError('Invalid BLE input slot')
-            on_data(packet[0], packet[1:])
+            raise ProtocolError('Legacy BLE protocol is not supported; restart both processes')
+        if header == b'\xfe':
+            slot, generation = INPUT_HEADER.unpack(_read_exact(stream, INPUT_HEADER.size))
+            if slot >= MAX_SLOTS or not valid_generation(generation):
+                raise ProtocolError('Invalid BLE input slot/generation')
+            report = _read_exact(stream, 64)
+            on_data(slot, generation, report)
             continue
         line = bytearray(header)
         while not line.endswith(b'\n'):
@@ -51,7 +61,16 @@ def read_event_stream(stream, on_data, on_event):
             raise ProtocolError('Malformed BLE event') from exc
         if not isinstance(event, dict) or not isinstance(event.get('e'), str):
             raise ProtocolError('BLE event must be an object with an event name')
+        if event['e'].startswith('_') or any(key.startswith('_') for key in event):
+            raise ProtocolError('Reserved internal metadata in BLE event')
         slot = event.get('s')
+        if event['e'] in {'status', 'connected', 'disconnected', 'connect_error',
+                           'devices_found', 'device_detected'} and slot is None:
+            raise ProtocolError('Missing slot in session event')
         if slot is not None and (type(slot) is not int or not 0 <= slot < MAX_SLOTS):
             raise ProtocolError('Invalid BLE event slot')
+        if slot is not None and not valid_generation(event.get('g')):
+            raise ProtocolError('Missing or invalid BLE event generation')
+        if event['e'] == 'ready' and (type(event.get('protocol')) is not int or event['protocol'] != PROTOCOL_VERSION):
+            raise ProtocolError('Incompatible BLE subprocess protocol')
         on_event(event)

@@ -1,38 +1,8 @@
 #!/usr/bin/env python3
-"""BLE subprocess for macOS/Windows — uses Bleak.
+"""BLE child entrypoint. Protocol v2 is defined in ipc.py/child_runtime.py.
 
-No elevated privileges needed. Same IPC protocol as ble_subprocess.py.
-
-Protocol:
-  Input data uses a binary format for minimal latency:
-    0xFF (1 byte magic) + slot_index (1 byte) + raw_data (64 bytes) = 66 bytes
-  All other events use JSON lines (which never start with 0xFF).
-
-  Parent -> Child commands (JSON lines):
-    {"cmd": "stop_bluez"}
-    {"cmd": "open"}
-    {"cmd": "scan_connect", "slot_index": 0, "target_address": "..."}
-    {"cmd": "scan_devices", "slot_index": 0}
-    {"cmd": "scan_start", "slot_index": 0}
-    {"cmd": "scan_stop"}
-    {"cmd": "connect_device", "slot_index": 0, "address": "..."}
-    {"cmd": "disconnect", "slot_index": 0, "address": "..."}
-    {"cmd": "shutdown"}
-
-  Child -> Parent events (JSON lines):
-    {"e": "ready"}
-    {"e": "bluez_stopped"}
-    {"e": "open_ok"}
-    {"e": "error", "ctx": "...", "msg": "..."}
-    {"e": "status", "s": <slot>, "msg": "..."}
-    {"e": "connected", "s": <slot>, "mac": "..."}
-    {"e": "connect_error", "s": <slot>, "msg": "..."}
-    {"e": "devices_found", "s": <slot>, "devices": [...]}
-    {"e": "device_detected", "s": <slot>, "device": {...}}
-    {"e": "disconnected", "s": <slot>}
-
-  Child -> Parent data (binary):
-    0xFF + slot_index(1) + raw_data(64) = 66 bytes total
+Input: 0xFE + wire slot (1 byte) + generation (8 bytes, big endian) + report (64).
+Slot-scoped JSON events/commands carry the same positive generation as `g`.
 """
 
 import json

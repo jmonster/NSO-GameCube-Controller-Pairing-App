@@ -6,7 +6,7 @@ import os
 import threading
 import time
 
-from .ipc import MAX_JSON_BYTES, MAX_SLOTS
+from .ipc import MAX_JSON_BYTES, MAX_SLOTS, INPUT_HEADER, valid_generation
 
 _logger = logging.getLogger(__name__)
 
@@ -84,10 +84,10 @@ class OutputWriter:
             raise error
         self.put(frame)
 
-    def data(self, slot, report):
-        if type(slot) is not int or not 0 <= slot < MAX_SLOTS or len(report) != 64:
+    def data(self, slot, report, generation):
+        if type(slot) is not int or not 0 <= slot < MAX_SLOTS or len(report) != 64 or not valid_generation(generation):
             raise ValueError('Expected a valid slot and a 64-byte translated input report')
-        self.put(bytes((0xff, slot)) + bytes(report))
+        self.put(b'\xfe' + INPUT_HEADER.pack(slot, generation) + bytes(report))
 
     def _run(self):
         try:

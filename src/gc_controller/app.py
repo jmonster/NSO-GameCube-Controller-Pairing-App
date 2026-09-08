@@ -95,13 +95,14 @@ def _get_settings_dir() -> str:
 
 from .calibration import CalibrationManager
 from .connection_manager import ConnectionManager
-from .emulation_manager import EmulationManager
+from .emulation_manager import EmulationManager, OutputStart
 from .input_processor import InputProcessor
 from .controller_slot import ControllerSlot, normalize_ble_address
 from .ble.sw2_protocol import build_rumble_packet
 from .ui_dispatch import MainThreadDispatcher
 from .ble.ipc import read_event_stream
 from .ble.parent import CommandTransport
+from .ble.sessions import address as normalize_ble_address
 
 # System tray support (optional).
 # On macOS, pystray runs [NSApplication run] from a background thread which
@@ -221,7 +222,6 @@ class GCControllerEnabler:
         self._ble_init_event = threading.Event()
         self._ble_init_result = None
         self._ble_pair_mode = {}  # slot_index -> 'pair' | 'reconnect' | 'autoscan'
-        self._ble_slot_remap = {}  # subprocess_slot -> actual UI slot (when reassigned)
         self._diff_scan_callback = {}  # slot_index -> completion callback
         self._scan_stream_callback: dict[int, callable] = {}
         self._ble_known_scan_slot = None  # slot being scanned for known-addr matching
@@ -650,7 +650,6 @@ class GCControllerEnabler:
         self._ble_subprocess = None
         transport, self._ble_commands = self._ble_commands, None
         self._ble_initialized = False
-        self._ble_slot_remap.clear()
         if transport is not None:
             transport.close()
 
@@ -658,17 +657,17 @@ class GCControllerEnabler:
         """Read only the process captured at thread creation, never its successor."""
         reason = "BLE subprocess closed its output"
 
-        def on_data(si, data):
-            if self._ble_subprocess is not proc:
-                return
-            si = self._ble_slot_remap.get(si, si)
-            if 0 <= si < len(self.slots):
-                # Overflow is an integrity failure, not permission to drop a
-                # press/release or block every other slot on this reader.
-                self.slots[si].ble_data_queue.put_nowait(data)
+        transport = self._ble_commands
+
+        def on_data(si, generation, data):
+            if self._ble_subprocess is proc and transport is not None:
+                transport.router.data(si, generation, data)
 
         def on_event(event):
-            if self._ble_subprocess is not proc:
+            if self._ble_subprocess is not proc or transport is None:
+                return
+            event = transport.router.event(event)
+            if event is None:
                 return
             if not self._ble_initialized and event['e'] in (
                     'ready', 'bluez_stopped', 'open_ok', 'error'):
@@ -689,9 +688,24 @@ class GCControllerEnabler:
                 self._call_on_ui_thread(self._ble_service_lost, proc, reason)
 
     def _dispatch_ble_event(self, proc, event):
-        """Re-check ownership when a queued callback actually reaches Tk."""
-        if self._ble_subprocess is proc:
+        """Re-check both process and wire generation when Tk actually handles it."""
+        transport = self._ble_commands
+        if self._ble_subprocess is not proc or transport is None:
+            return
+        try:
+            event = transport.router.event(event)
+            if event is None:
+                return
             self._handle_ble_event(event)
+            if event['e'] == 'connected':
+                mac = normalize_ble_address(event.get('mac'))
+                for si, slot in enumerate(self.slots):
+                    if slot.ble_connected and normalize_ble_address(slot.ble_address) == mac:
+                        transport.router.bind(event, si, slot.ble_data_queue.put_nowait)
+                        break
+            transport.router.finish(event)
+        except Exception as exc:
+            self._ble_service_lost(proc, f'BLE event delivery failed: {exc}')
 
     def _ble_service_lost(self, proc, reason):
         """Retire failed BLE input without touching independently connected USB."""
@@ -791,10 +805,8 @@ class GCControllerEnabler:
                 cb(event.get('device', {}))
 
         elif etype == 'disconnected' and si is not None:
-            actual_si = self._ble_slot_remap.get(si, si)
-            logger.info("BLE disconnected: subprocess_slot=%d actual_slot=%d",
-                        si, actual_si)
-            self._on_ble_disconnect(actual_si)
+            # SessionRouter has already resolved the installed destination.
+            self._on_ble_disconnect(si)
 
         elif etype == 'error':
             self._messagebox.showerror(
@@ -1111,7 +1123,6 @@ class GCControllerEnabler:
             if subprocess_slot != slot_index:
                 logger.info("Reassigned BLE from subprocess slot %d → slot %d, "
                             "updating LED", subprocess_slot, slot_index)
-                self._ble_slot_remap[subprocess_slot] = slot_index
                 self._send_ble_cmd({
                     "cmd": "set_led",
                     "slot_index": subprocess_slot,
@@ -1469,11 +1480,9 @@ class GCControllerEnabler:
 
     def _pick_auto_scan_slot(self):
         """Pick the first free slot for auto-scan. Returns slot index or None."""
-        subprocess_slots_in_use = set(self._ble_slot_remap.keys())
         for i in range(MAX_SLOTS):
             if (not self.slots[i].is_connected
-                    and i not in self._ble_pair_mode
-                    and i not in subprocess_slots_in_use):
+                    and i not in self._ble_pair_mode):
                 return i
         return None
 
@@ -1539,7 +1548,6 @@ class GCControllerEnabler:
         if subprocess_slot != slot_index:
             logger.info("Auto-scan: reassigned BLE from subprocess slot %d → "
                         "slot %d, updating LED", subprocess_slot, slot_index)
-            self._ble_slot_remap[subprocess_slot] = slot_index
             self._send_ble_cmd({
                 "cmd": "set_led",
                 "slot_index": subprocess_slot,
@@ -1680,14 +1688,7 @@ class GCControllerEnabler:
             self._auto_scan_slot = None
         self._ble_pair_mode.pop(slot_index, None)
 
-        # Remove any data routing remap that pointed to this slot
-        stale = [k for k, v in self._ble_slot_remap.items() if v == slot_index]
-        for k in stale:
-            del self._ble_slot_remap[k]
-
-        # Check if a USB controller just connected on another slot —
-        # if so, it's likely the same physical controller switching
-        # from BLE to USB.  Migrate USB to this slot silently.
+        # A known, explicitly linked USB identity may move to this slot.
         self._try_cross_transport_migration(slot_index)
         if slot.is_connected:
             # Migration succeeded — no need to show disconnect/reconnect UI
@@ -1778,7 +1779,6 @@ class GCControllerEnabler:
         if subprocess_slot != slot_index:
             logger.info("BLE reconnect: reassigned from subprocess slot %d → "
                         "slot %d, updating LED", subprocess_slot, slot_index)
-            self._ble_slot_remap[subprocess_slot] = slot_index
             self._send_ble_cmd({
                 "cmd": "set_led",
                 "slot_index": subprocess_slot,
@@ -3118,19 +3118,23 @@ class _BleHeadlessManager:
         """Deliver only the captured process's stream and report every loss."""
         reason = "BLE subprocess closed its output"
 
-        def data(si, payload):
-            if self._subprocess is proc:
-                on_data(si, payload)
+        transport = self._commands
+
+        def data(si, generation, payload):
+            if self._subprocess is proc and transport is not None:
+                transport.router.data(si, generation, payload)
 
         def event(value):
-            if self._subprocess is not proc:
+            if self._subprocess is not proc or transport is None:
+                return
+            value = transport.router.event(value)
+            if value is None:
                 return
             if not self._initialized and value['e'] in (
                     'ready', 'bluez_stopped', 'open_ok', 'error'):
                 self._init_result = value
                 self._init_event.set()
             else:
-                # Internal ownership marker, not sent over IPC.
                 on_event({**value, '_process': proc})
 
         try:
@@ -3181,11 +3185,14 @@ def run_headless(mode_override: str = None):
         print(get_emulation_unavailable_reason(mode))
         sys.exit(1)
 
+    output_starts = set()
     stop_event = threading.Event()
     disconnect_events = [threading.Event() for _ in range(MAX_SLOTS)]
 
     def _shutdown(signum, frame):
         stop_event.set()
+        for operation in tuple(output_starts):
+            operation.cancel_event.set()
         for de in disconnect_events:
             de.set()
 
@@ -3260,20 +3267,41 @@ def run_headless(mode_override: str = None):
             rumble_tids[slot_idx] = (rumble_tids[slot_idx] + 1) & 0x0F
 
             # Check if this slot is BLE
-            is_ble = False
+            ble_address = None
             for s in active_slots:
                 if s['index'] == slot_idx and s['type'] == 'ble':
-                    is_ble = True
+                    ble_address = s.get('ble_address')
                     break
-            if is_ble and ble_mgr and ble_mgr.is_alive:
+            if ble_address and ble_mgr and ble_mgr.is_alive:
                 ble_mgr.send_cmd({
                     "cmd": "rumble",
                     "slot_index": slot_idx,
+                    "address": ble_address,
                     "data": base64.b64encode(packet).decode('ascii'),
                 })
             elif conn_mgr_ref and conn_mgr_ref.device:
                 conn_mgr_ref.send_rumble(new_state)
         return _on_rumble
+
+    def _start_output(slot_info, slot_mode):
+        index = slot_info['index']
+        def completed(operation, error):
+            ble_event_queue.put({'e': '_output_complete', 'owner': slot_info,
+                                 'operation': operation, 'error': error})
+        operation = OutputStart(slot_info['emu_mgr'], slot_mode, index,
+                                _make_headless_rumble_cb(index, slot_info['conn_mgr']), completed)
+        slot_info['output_start'] = operation
+        output_starts.add(operation)
+        if stop_event.is_set():
+            operation.cancel_event.set()
+        operation.launch()
+
+    def _stop_output(slot_info):
+        operation = slot_info.get('output_start')
+        if operation is not None:
+            operation.stop()
+        else:
+            slot_info['emu_mgr'].stop()
 
     def _connect_slot(i, path):
         """Helper to connect a single USB slot to a specific HID path."""
@@ -3295,17 +3323,6 @@ def run_headless(mode_override: str = None):
 
         mode_label = {"dolphin_pipe": "Dolphin pipe", "dsu": "DSU server"}.get(slot_mode, "Xbox 360")
         print(f"[slot {i + 1}] Starting {mode_label} emulation...")
-        try:
-            rumble_cb = _make_headless_rumble_cb(i, conn_mgr_ref=conn_mgr)
-            emu_mgr.start(slot_mode, slot_index=i, rumble_callback=rumble_cb, cancel_event=stop_event)
-            if slot_mode == 'dsu':
-                port = getattr(emu_mgr.gamepad, 'port', 26760)
-                print(f"[slot {i + 1}] DSU server on port {port}")
-        except Exception as e:
-            print(f"[slot {i + 1}] Failed to start emulation: {e}")
-            conn_mgr.disconnect()
-            return
-
         disc_event = disconnect_events[i]
 
         input_proc = InputProcessor(
@@ -3329,6 +3346,7 @@ def run_headless(mode_override: str = None):
             'device_path': path,
             'disc_event': disc_event,
         })
+        _start_output(active_slots[-1], slot_mode)
 
     claimed_slot_indices = set()
 
@@ -3428,6 +3446,19 @@ def run_headless(mode_override: str = None):
         """Process a BLE runtime event in the main loop."""
         nonlocal ble_scanning_slot
 
+        if event.get('e') == '_output_complete':
+            operation = event['operation']
+            output_starts.discard(operation)
+            owner = event['owner']
+            if (not any(s is owner for s in active_slots) or
+                    owner.get('output_start') is not operation or operation.cancel_event.is_set()):
+                return
+            if event.get('error'):
+                print(f"[slot {owner['index'] + 1}] Output unavailable: {event['error']}")
+            else:
+                print(f"[slot {owner['index'] + 1}] {operation.mode} output ready")
+            return
+
         owner = event.get('_process')
         if owner is not None and (ble_mgr is None or ble_mgr._subprocess is not owner):
             return
@@ -3439,7 +3470,7 @@ def run_headless(mode_override: str = None):
                 if slot_info['type'] != 'ble':
                     continue
                 slot_info['input_proc'].stop()
-                slot_info['emu_mgr'].stop()
+                _stop_output(slot_info)
                 si = slot_info['index']
                 rumble_states[si] = False
                 active_slots.remove(slot_info)
@@ -3447,6 +3478,12 @@ def run_headless(mode_override: str = None):
             print(f"BLE service stopped: {event.get('msg', '')}. USB remains available.")
             return
 
+        if 'g' in event:
+            if ble_mgr is None or ble_mgr._commands is None:
+                return
+            event = ble_mgr._commands.router.event(event)
+            if event is None:
+                return
         etype = event.get('e')
         si = event.get('s')
 
@@ -3490,17 +3527,6 @@ def run_headless(mode_override: str = None):
             mode_label = {"dolphin_pipe": "Dolphin pipe", "dsu": "DSU server"}.get(slot_mode, "Xbox 360")
             print(f"[slot {si + 1}] Starting {mode_label} emulation...")
 
-            try:
-                rumble_cb = _make_headless_rumble_cb(si)
-                emu_mgr.start(slot_mode, slot_index=si, rumble_callback=rumble_cb, cancel_event=stop_event)
-                if slot_mode == 'dsu':
-                    port = getattr(emu_mgr.gamepad, 'port', 26760)
-                    print(f"[slot {si + 1}] DSU server on port {port}")
-            except Exception as e:
-                print(f"[slot {si + 1}] Failed to start emulation: {e}")
-                ble_data_queues.pop(si, None)
-                return
-
             disc_event = disconnect_events[si]
 
             input_proc = InputProcessor(
@@ -3525,8 +3551,11 @@ def run_headless(mode_override: str = None):
                 'device_path': None,
                 'disc_event': disc_event,
                 'ble_address': mac,
+                'ble_generation': event.get('g'),
             })
 
+            ble_mgr._commands.router.bind(event, si, ble_q.put_nowait)
+            _start_output(active_slots[-1], slot_mode)
             ble_scanning_slot = None
 
             # Scan for more controllers if open slots remain
@@ -3536,6 +3565,7 @@ def run_headless(mode_override: str = None):
                 print("All slots occupied.")
 
         elif etype == 'connect_error' and si is not None:
+            ble_mgr._commands.router.finish(event)
             msg = event.get('msg', 'Connection failed')
             print(f"[slot {si + 1}] BLE connect error: {msg}")
 
@@ -3555,6 +3585,7 @@ def run_headless(mode_override: str = None):
                         {'e': '_retry_scan'})).start()
 
         elif etype == 'disconnected' and si is not None:
+            ble_mgr._commands.router.finish(event)
             # Find the active slot info
             slot_info = None
             for s in active_slots:
@@ -3569,8 +3600,7 @@ def run_headless(mode_override: str = None):
             # Stop input/emulation
             slot_info['input_proc'].stop()
             was_emulating = slot_info['emu_mgr'].is_emulating
-            if was_emulating:
-                slot_info['emu_mgr'].stop()
+            _stop_output(slot_info)
             slot_info['was_emulating'] = was_emulating
 
             # Remove from active slots so the slot is "open"
@@ -3599,7 +3629,9 @@ def run_headless(mode_override: str = None):
 
         elif etype == '_retry_reconnect' and si is not None:
             mac = event.get('mac')
-            if not stop_event.is_set() and si in ble_pending_reconnects and mac:
+            if (not stop_event.is_set() and mac
+                    and normalize_ble_address(ble_pending_reconnects.get(si)) == normalize_ble_address(mac)
+                    and si in _open_ble_slots() and ble_mgr and ble_mgr.is_alive):
                 print(f"[slot {si + 1}] BLE retrying reconnect to {mac}...")
                 ble_mgr.send_cmd({
                     "cmd": "scan_connect",
@@ -3613,6 +3645,15 @@ def run_headless(mode_override: str = None):
 
         elif etype == 'error':
             print(f"BLE Error: {event.get('msg', 'Unknown error')}")
+
+    def _dispatch_headless_ble_event(event):
+        try:
+            _handle_headless_ble_event(event)
+        except Exception as exc:
+            logger.exception('Headless BLE event delivery failed')
+            if ble_mgr is not None and ble_mgr._subprocess is not None:
+                _handle_headless_ble_event({'e': 'service_lost',
+                    '_process': ble_mgr._subprocess, 'msg': str(exc)})
 
     # ── Initialize BLE if needed ───────────────────────────────────
     if ble_available and _open_ble_slots():
@@ -3644,7 +3685,7 @@ def run_headless(mode_override: str = None):
         while True:
             try:
                 ev = ble_event_queue.get_nowait()
-                _handle_headless_ble_event(ev)
+                _dispatch_headless_ble_event(ev)
             except _queue.Empty:
                 break
 
@@ -3670,9 +3711,8 @@ def run_headless(mode_override: str = None):
                     pass
                 conn_mgr.device = None
 
-            was_emulating = emu_mgr.is_emulating
-            if emu_mgr.is_emulating:
-                emu_mgr.stop()
+            was_emulating = emu_mgr.is_emulating or emu_mgr.is_starting
+            _stop_output(slot_info)
 
             print(f"[slot {idx + 1}] USB controller disconnected — reconnecting...")
 
@@ -3718,25 +3758,14 @@ def run_headless(mode_override: str = None):
                         if was_emulating:
                             slot_mode = mode_override if mode_override else \
                                 slot_calibrations[idx].get('emulation_mode', mode)
-                            try:
-                                rumble_cb = _make_headless_rumble_cb(
-                                    idx, conn_mgr_ref=conn_mgr)
-                                emu_mgr.start(slot_mode, slot_index=idx,
-                                              rumble_callback=rumble_cb, cancel_event=stop_event)
-                                mode_label = {"dolphin_pipe": "Dolphin pipe", "dsu": "DSU server"}.get(slot_mode, "Xbox 360")
-                                print(f"[slot {idx + 1}] {mode_label} emulation resumed.")
-                                if slot_mode == 'dsu':
-                                    port = getattr(emu_mgr.gamepad, 'port', 26760)
-                                    print(f"[slot {idx + 1}] DSU server on port {port}")
-                            except Exception as e:
-                                print(f"[slot {idx + 1}] Failed to resume emulation: {e}")
+                            _start_output(slot_info, slot_mode)
                         break
 
                 # Also drain BLE events while waiting for USB reconnect
                 while True:
                     try:
                         ev = ble_event_queue.get_nowait()
-                        _handle_headless_ble_event(ev)
+                        _dispatch_headless_ble_event(ev)
                     except _queue.Empty:
                         break
 
@@ -3754,12 +3783,13 @@ def run_headless(mode_override: str = None):
                 ble_mgr.send_cmd({
                     "cmd": "rumble",
                     "slot_index": idx,
+                    "address": slot_info.get('ble_address'),
                     "data": base64.b64encode(packet).decode('ascii'),
                 })
             elif slot_info['conn_mgr'] and slot_info['conn_mgr'].device:
                 slot_info['conn_mgr'].send_rumble(False)
         slot_info['input_proc'].stop()
-        slot_info['emu_mgr'].stop()
+        _stop_output(slot_info)
         if slot_info['type'] == 'usb' and slot_info['conn_mgr']:
             slot_info['conn_mgr'].disconnect()
     if ble_mgr:

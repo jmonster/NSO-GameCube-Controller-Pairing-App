@@ -9,7 +9,7 @@ import sys
 import threading
 from dataclasses import dataclass, field
 
-from .ipc import MAX_JSON_BYTES, MAX_SLOTS
+from .ipc import MAX_JSON_BYTES, MAX_SLOTS, PROTOCOL_VERSION, valid_generation
 from .output import OutputWriter
 
 _logger = logging.getLogger(__name__)
@@ -23,6 +23,7 @@ def _address(value):
 class _Session:
     slot: int
     target: str | None
+    generation: int
     identifier: str | None = None
     ready: bool = False
     disconnected: bool = False
@@ -40,7 +41,7 @@ class _InputQueue:
         if not self.runner.owns(session) or session.disconnected:
             return
         if session.ready:
-            self.runner.output.data(session.slot, report)
+            self.runner.output.data(session.slot, report, session.generation)
         else:
             # Before readiness there is no active consumer. Seed it with the
             # last initialization state AFTER the connected event is emitted.
@@ -64,6 +65,7 @@ class ChildRunner:
         self.sessions = {}
         self.scan_task = None
         self.scan_token = None
+        self._last_generation = 0
 
     def owns(self, session):
         return self.sessions.get(session.slot) is session
@@ -89,14 +91,14 @@ class ChildRunner:
     async def _connect(self, session, direct, options):
         def status(message):
             if self.owns(session):
-                self.output.event({'e': 'status', 's': session.slot, 'msg': message})
+                self.output.event({'e': 'status', 's': session.slot, 'g': session.generation, 'msg': message})
 
         def disconnected():
             if not self.owns(session) or session.disconnected:
                 return
             session.disconnected = True
             if session.ready:
-                self.output.event({'e': 'disconnected', 's': session.slot})
+                self.output.event({'e': 'disconnected', 's': session.slot, 'g': session.generation})
 
         accepted = False
         identifier = None
@@ -117,9 +119,9 @@ class ChildRunner:
             if identifier and self.owns(session) and not session.disconnected:
                 session.identifier = identifier
                 session.ready = True
-                self.output.event({'e': 'connected', 's': session.slot, 'mac': identifier})
+                self.output.event({'e': 'connected', 's': session.slot, 'g': session.generation, 'mac': identifier})
                 if session.pending_input is not None:
-                    self.output.data(session.slot, session.pending_input)
+                    self.output.data(session.slot, session.pending_input, session.generation)
                     session.pending_input = None
                 accepted = True
         except asyncio.CancelledError:
@@ -131,7 +133,7 @@ class ChildRunner:
                 if self.owns(session):
                     self.sessions.pop(session.slot, None)
                     try:
-                        self.output.event({'e': 'connect_error', 's': session.slot, 'msg': error})
+                        self.output.event({'e': 'connect_error', 's': session.slot, 'g': session.generation, 'msg': error})
                     except ConnectionError:
                         pass  # A dead parent must not prevent device cleanup.
                 # Backend cancellation must also release partial connections;
@@ -153,22 +155,22 @@ class ChildRunner:
         if stop is not None:
             await stop()
 
-    async def _scan(self, slot, token, continuous):
+    async def _scan(self, slot, token, continuous, generation):
         def found(device):
             if self.scan_token is token:
-                self.output.event({'e': 'device_detected', 's': slot, 'device': device})
+                self.output.event({'e': 'device_detected', 's': slot, 'g': generation, 'device': device})
         try:
             if continuous:
                 await self.backend.start_scan(on_device_found=found)
             else:
                 devices = await self.backend.scan_only()
                 if self.scan_token is token:
-                    self.output.event({'e': 'devices_found', 's': slot, 'devices': devices})
+                    self.output.event({'e': 'devices_found', 's': slot, 'g': generation, 'devices': devices})
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             if self.scan_token is token:
-                self.output.event({'e': 'connect_error', 's': slot, 'msg': str(exc)})
+                self.output.event({'e': 'connect_error', 's': slot, 'g': generation, 'msg': str(exc)})
 
     def _feedback(self, session, action, data):
         async def run():
@@ -191,12 +193,13 @@ class ChildRunner:
         """Feedback/disconnect addresses identify ownership after UI slot moves."""
         address = cmd.get('address')
         if address is None:
-            return self.sessions.get(cmd['slot_index'])
+            session = self.sessions.get(cmd['slot_index'])
+            return session if session and session.generation == cmd.get('g') else None
         if not isinstance(address, str) or not address:
             raise ValueError('Invalid BLE command address')
         matches = [session for session in self.sessions.values()
                    if _address(address) in (_address(session.identifier), _address(session.target))]
-        return matches[0] if len(matches) == 1 else None
+        return matches[0] if len(matches) == 1 and matches[0].generation == cmd.get('g') else None
 
     async def command(self, cmd):
         if not isinstance(cmd, dict) or not isinstance(cmd.get('cmd'), str):
@@ -207,6 +210,15 @@ class ChildRunner:
                       'disconnect', 'rumble', 'set_led'}:
             if type(slot) is not int or not 0 <= slot < MAX_SLOTS:
                 raise ValueError('Invalid BLE command slot')
+        generation = cmd.get('g')
+        if action in {'scan_connect', 'connect_device', 'scan_devices', 'scan_start',
+                      'disconnect', 'rumble', 'set_led'}:
+            if not valid_generation(generation):
+                raise ValueError('Missing or invalid BLE command generation')
+        if action in {'scan_connect', 'connect_device', 'scan_devices', 'scan_start'}:
+            if generation <= self._last_generation:
+                raise ValueError('Replayed BLE session generation')
+            self._last_generation = generation
         if action in ('close', 'shutdown'):
             return False
         if action == 'stop_bluez':
@@ -236,26 +248,28 @@ class ChildRunner:
             if target and any(s.slot != slot and not s.disconnected and _address(target) in
                               (_address(s.target), _address(s.identifier))
                               for s in self.sessions.values()):
-                self.output.event({'e': 'connect_error', 's': slot,
+                self.output.event({'e': 'connect_error', 's': slot, 'g': generation,
                                    'msg': 'Controller is already assigned to another slot'})
                 return True
             await self._stop_scan()
             await self._retire(slot)
-            session = _Session(slot, target)
+            session = _Session(slot, target, generation)
             self.sessions[slot] = session
             session.task = asyncio.create_task(self._connect(session, action == 'connect_device', cmd))
         elif action in ('scan_devices', 'scan_start'):
             await self._stop_scan()
-            session = self.sessions.get(slot)
-            if session and not session.ready:
-                await self._retire(slot)
+            # Discovery is independent of wire slot allocation. Explicit
+            # cancellation owns retiring connection attempts, not a UI index.
             token = self.scan_token = object()
-            self.scan_task = asyncio.create_task(self._scan(slot, token, action == 'scan_start'))
+            self.scan_task = asyncio.create_task(self._scan(slot, token, action == 'scan_start', generation))
         elif action == 'scan_stop':
             await self._stop_scan()
         elif action == 'cancel_all_scans':
+            generations = cmd.get('cancel_generations', [])
+            if not isinstance(generations, list) or len(generations) > MAX_SLOTS or not all(valid_generation(g) for g in generations):
+                raise ValueError('Invalid cancellation generations')
             for index, session in list(self.sessions.items()):
-                if not session.ready:
+                if not session.ready or session.generation in generations:
                     await self._retire(index)
             await self._stop_scan()
         elif action == 'disconnect':
@@ -280,7 +294,7 @@ class ChildRunner:
 
     async def run(self, commands):
         try:
-            self.output.event({'e': 'ready'})
+            self.output.event({'e': 'ready', 'protocol': PROTOCOL_VERSION})
             while True:
                 cmd = await asyncio.to_thread(commands.get)
                 if cmd is None or not await self.command(cmd):

@@ -8,10 +8,11 @@ from unittest.mock import Mock
 from _support import load_definitions, load_module
 
 ipc = load_module('ble/ipc.py')
+sessions = load_module('ble/sessions.py')
 
 
-def packet(slot=0, payload=None):
-    return b'\xff' + bytes([slot]) + (payload or bytes(range(64)))
+def packet(slot=0, payload=None, generation=1):
+    return b'\xfe' + ipc.INPUT_HEADER.pack(slot, generation) + (payload or bytes(range(64)))
 
 
 class Fragmented(io.BytesIO):
@@ -22,18 +23,18 @@ class Fragmented(io.BytesIO):
 class FramingTests(unittest.TestCase):
     def parse(self, raw, stream=io.BytesIO):
         data, events = [], []
-        ipc.read_event_stream(stream(raw), lambda si, value: data.append((si, value)), events.append)
+        ipc.read_event_stream(stream(raw), lambda si, generation, value: data.append((si, generation, value)), events.append)
         return data, events
 
     def test_interleaved_events_and_fragmented_binary_payloads(self):
-        raw = b'{"e":"connected","s":0}\n' + packet() + b'{"e":"disconnected","s":0}\n'
+        raw = b'{"e":"connected","s":0,"g":1}\n' + packet() + b'{"e":"disconnected","s":0,"g":1}\n'
         data, events = self.parse(raw, Fragmented)
-        self.assertEqual(data, [(0, bytes(range(64)))])
+        self.assertEqual(data, [(0, 1, bytes(range(64)))])
         self.assertEqual([e['e'] for e in events], ['connected', 'disconnected'])
 
     def test_payload_delimiters_have_no_special_meaning(self):
         payload = (b'\xff\n{}' * 16)
-        self.assertEqual(self.parse(packet(3, payload))[0], [(3, payload)])
+        self.assertEqual(self.parse(packet(3, payload))[0], [(3, 1, payload)])
 
     def test_every_truncated_binary_packet_is_rejected(self):
         raw = packet()
@@ -42,7 +43,7 @@ class FramingTests(unittest.TestCase):
                 self.parse(raw[:length])
 
     def test_malformed_json_and_invalid_slots_fail_closed(self):
-        for raw in (b'[]\n', b'null\n', b'{}\n', b'{bad}\n', b'\xfe\n',
+        for raw in (b'[]\n', b'null\n', b'{}\n', b'{bad}\n', b'\xff\n',
                     b'{"e":"status","s":-1}\n', b'{"e":"status","s":true}\n',
                     b'{"e":"status","s":4}\n', packet(4)):
             with self.subTest(raw=raw[:30]), self.assertRaises(ipc.ProtocolError):
@@ -63,13 +64,19 @@ class ParentOwnershipTests(unittest.TestCase):
         names = {'_ble_event_reader', '_dispatch_ble_event', '_ble_service_lost'}
         methods = load_definitions('app.py', names,
                                   {'read_event_stream': ipc.read_event_stream,
-                                   'logger': logging.getLogger('test')},
+                                   'logger': logging.getLogger('test'),
+                                   'normalize_ble_address': sessions.address},
                                   class_name='GCControllerEnabler')
         obj = types.SimpleNamespace(_ble_subprocess=types.SimpleNamespace(stdout=io.BytesIO(raw)),
                                     _ble_initialized=True, _ble_slot_remap={},
                                     _ble_init_event=threading.Event(),
                                     slots=[types.SimpleNamespace(ble_data_queue=queue.Queue(maxsize=1))],
                                     _handle_ble_event=Mock(), calls=[])
+        router = sessions.SessionRouter()
+        router.prepare({'cmd': 'connect_device', 'slot_index': 0, 'address': 'first'})
+        ready = router.event({'e': 'connected', 's': 0, 'g': 1, 'mac': 'first'})
+        router.bind(ready, 0, obj.slots[0].ble_data_queue.put_nowait)
+        obj._ble_commands = types.SimpleNamespace(router=router)
         for name in names: setattr(obj, name, types.MethodType(methods[name], obj))
         obj._call_on_ui_thread = lambda fn, *args: obj.calls.append((fn, args))
         return obj
@@ -82,7 +89,7 @@ class ParentOwnershipTests(unittest.TestCase):
         self.assertEqual(obj.calls[-1][0].__name__, '_ble_service_lost')
 
     def test_old_gui_callbacks_cannot_mutate_replacement_process(self):
-        obj = self.gui(b'{"e":"disconnected","s":0}\n')
+        obj = self.gui(b'{"e":"disconnected","s":0,"g":1}\n')
         old = obj._ble_subprocess
         obj._ble_event_reader(old)
         obj._ble_subprocess = object()
@@ -104,6 +111,11 @@ class ParentOwnershipTests(unittest.TestCase):
         for raw in (b'', packet()):
             obj = types.SimpleNamespace(_subprocess=types.SimpleNamespace(stdout=io.BytesIO(raw)),
                                         _initialized=True, _init_event=threading.Event())
+            router = sessions.SessionRouter()
+            router.prepare({'cmd': 'connect_device', 'slot_index': 0, 'address': 'first'})
+            ready = router.event({'e': 'connected', 's': 0, 'g': 1, 'mac': 'first'})
+            router.bind(ready, 0, Mock(side_effect=BufferError))
+            obj._commands = types.SimpleNamespace(router=router)
             events = []
             with unittest.mock.patch.object(logging.getLogger('test'), 'warning'):
                 method(obj, Mock(side_effect=BufferError), events.append, obj._subprocess)
@@ -117,7 +129,7 @@ class ParentOwnershipTests(unittest.TestCase):
                                  {'read_event_stream': ipc.read_event_stream,
                                   'logger': logging.getLogger('test')},
                                  class_name='_BleHeadlessManager')['_event_reader']
-        obj = types.SimpleNamespace(_subprocess=object(), _initialized=True)
+        obj = types.SimpleNamespace(_subprocess=object(), _initialized=True, _commands=None)
         data, events = Mock(), Mock()
         method(obj, data, events, types.SimpleNamespace(stdout=io.BytesIO(packet())))
         data.assert_not_called(); events.assert_not_called()

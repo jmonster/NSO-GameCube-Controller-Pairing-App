@@ -3,6 +3,7 @@ import logging
 import threading
 
 from .output import OutputWriter
+from .sessions import SessionRouter
 
 logger = logging.getLogger(__name__)
 _live = set()
@@ -25,6 +26,8 @@ class CommandTransport:
         self._grace_timeout = grace_timeout
         self._terminate_timeout = terminate_timeout
         self._lock = threading.Lock()
+        self._send_lock = threading.RLock()
+        self.router = SessionRouter()
         self._closing = False
         self._failed = False
         self._done = threading.Event()
@@ -50,23 +53,30 @@ class CommandTransport:
             self.close()
 
     def send(self, command):
-        with self._lock:
-            if self._closing or self._failed:
+        # Keep generation allocation and frame publication in the same order
+        # even when UI actions and rumble callbacks come from different threads.
+        with self._send_lock:
+            with self._lock:
+                if self._closing or self._failed:
+                    return False
+            try:
+                if self.process.poll() is not None:
+                    raise ConnectionError('BLE subprocess has exited')
+                prepared = self.router.prepare(command)
+                if prepared is None:
+                    return False
+                self._writer.event(prepared)
+                return True
+            except Exception as error:
+                self._failed_write(error)
                 return False
-        try:
-            if self.process.poll() is not None:
-                raise ConnectionError('BLE subprocess has exited')
-            self._writer.event(command)
-            return True
-        except Exception as error:
-            self._failed_write(error)
-            return False
 
     def close(self, *, wait=False):
         with self._lock:
             start = not self._closing
             self._closing = True
         if start:
+            self.router.clear()
             # Zero join: producers/main thread must never wait on a full pipe.
             self._writer.close(0)
             threading.Thread(target=self._reap, name='ble-process-reaper',

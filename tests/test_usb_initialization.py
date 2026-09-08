@@ -112,14 +112,13 @@ class ApplicationInitializationTests(TestCase):
         self.assertEqual(app.slot_calibrations[0]['device_links'], {})
         self.assertIn(1, app._recent_usb_hotplug)
 
-    def test_every_headless_factory_receives_shutdown_cancellation(self):
+    def test_headless_output_creation_does_not_block_event_processing(self):
         tree = ast.parse((SRC / 'app.py').read_text(encoding='utf-8'))
         func = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'run_headless')
-        calls = [n for n in ast.walk(func) if isinstance(n, ast.Call)
-                 and isinstance(n.func, ast.Attribute) and n.func.attr == 'start'
-                 and isinstance(n.func.value, ast.Name) and n.func.value.id == 'emu_mgr']
-        self.assertEqual(len(calls), 3)
-        for call in calls:
-            cancel = next((k.value for k in call.keywords if k.arg == 'cancel_event'), None)
-            self.assertIsInstance(cancel, ast.Name)
-            self.assertEqual(cancel.id, 'stop_event')
+        blocking = [n for n in ast.walk(func) if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute) and n.func.attr == 'start'
+                    and isinstance(n.func.value, ast.Name) and n.func.value.id == 'emu_mgr']
+        self.assertEqual(blocking, [])
+        dispatch = [n for n in ast.walk(func) if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Name) and n.func.id == '_start_output']
+        self.assertEqual(len(dispatch), 3)

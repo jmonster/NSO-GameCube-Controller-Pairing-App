@@ -157,6 +157,7 @@ hiddenimports = [
     'gc_controller.ble.ipc',
     'gc_controller.ble.output',
     'gc_controller.ble.parent',
+    'gc_controller.ble.sessions',
     'gc_controller.ble.child_runtime',
     'tkinter',
     'tkinter.ttk',
