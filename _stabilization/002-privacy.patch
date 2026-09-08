@@ -1,0 +1,22 @@
+From 3364b97709ec683c33f79060aafc9e80ea3a3c52 Mon Sep 17 00:00:00 2001
+From: OpenAI <noreply@openai.com>
+Date: Tue, 8 Sep 2026 18:26:14 +0000
+Subject: [PATCH] fix(macos): declare Bluetooth privacy purpose in packaged app
+
+---
+ gc_controller_enabler.spec | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/gc_controller_enabler.spec b/gc_controller_enabler.spec
+--- a/gc_controller_enabler.spec
++++ b/gc_controller_enabler.spec
+@@ -285,6 +285,9 @@ if sys.platform == "darwin":
+             'NSPrincipalClass': 'NSApplication',
+             'NSAppleScriptEnabled': False,
+             'NSHighResolutionCapable': True,
++            'NSBluetoothAlwaysUsageDescription': (
++                'Connect to your Nintendo GameCube controller and receive its input.'
++            ),
+             'LSUIElement': False,
+             'NSRequiresAquaSystemAppearance': False,
+         },
