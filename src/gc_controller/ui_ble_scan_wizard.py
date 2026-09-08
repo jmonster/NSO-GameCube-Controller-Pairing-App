@@ -14,13 +14,11 @@ import customtkinter
 
 from . import ui_theme as T
 from .i18n import t
+from .ble_identifiers import NINTENDO_COMPANY_ID
 
 logger = logging.getLogger(__name__)
 
-_NINTENDO_COMPANY_IDS = frozenset({
-    '894',   # 0x037E — Nintendo (classic controllers)
-    '1363',  # 0x0553 — Nintendo (Switch 2 controllers)
-})
+_NINTENDO_COMPANY_IDS = frozenset({str(NINTENDO_COMPANY_ID)})
 
 _NINTENDO_SERVICE_UUIDS = frozenset({
     '00c5af5d-1964-4e30-8f51-1956f96bd280',
@@ -34,6 +32,7 @@ _NINTENDO_OUI = frozenset({
     '2C:10:C1', '34:AF:2C', '48:A5:E7', '64:B5:C6',
     '8C:56:C5', '9C:E6:35', 'A0:AB:1B', 'B0:9F:BA',
     'BC:83:85', 'E4:17:D8', 'E8:65:D4', 'EC:10:7B',
+    'E0:EF:BF', '94:8E:6D',
 })
 
 _CONTROLLER_NAME_PATTERNS = (

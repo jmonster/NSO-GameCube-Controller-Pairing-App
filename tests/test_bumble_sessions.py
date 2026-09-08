@@ -186,3 +186,17 @@ class BumbleSessionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await self.backend._scan(0.1), address)
             self.assertFalse(listeners)
             device.stop_scanning.assert_awaited_once()
+
+    async def test_company_identification_handles_new_oui_without_false_vendor_ids(self):
+        listeners = []
+        async def start(**kwargs):
+            for company, suffix in ((0x037E, '01'), (0x057E, '02'), (0x0553, '03')):
+                for callback in listeners:
+                    callback(types.SimpleNamespace(address='AA:BB:CC:00:00:' + suffix,
+                        data={0xFF: company.to_bytes(2, 'little') + b'\x01'}))
+        device = types.SimpleNamespace(on=lambda name, cb: listeners.append(cb),
+            remove_listener=lambda name, cb: listeners.remove(cb),
+            start_scanning=start, stop_scanning=AsyncMock())
+        self.backend._device = device
+        self.assertEqual(await self.backend._scan(0.1), 'AA:BB:CC:00:00:03')
+        self.assertFalse(listeners)

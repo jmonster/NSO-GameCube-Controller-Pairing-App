@@ -26,10 +26,9 @@ from .sw2_protocol import (
     LED_MAP, build_led_cmd, translate_ble_native_to_usb,
 )
 
-_logger = logging.getLogger(__name__)
+from ..ble_identifiers import NINTENDO_COMPANY_ID as _NINTENDO_COMPANY_ID
 
-# Nintendo BLE manufacturer company ID (from protocol doc)
-_NINTENDO_COMPANY_ID = 0x037E
+_logger = logging.getLogger(__name__)
 _SW2_SERVICE_UUID = 'ab7de9be-89fe-49ad-828f-118f09df7fd0'
 _CONTROL_SERVICE_UUID = '00c5af5d-1964-4e30-8f51-1956f96bd280'
 _INPUT_READY_TIMEOUT = 5.0
@@ -228,6 +227,10 @@ class BleakBackend:
                 md = getattr(adv, 'manufacturer_data', {})
                 if _NINTENDO_COMPANY_ID in md:
                     return True
+                services = {uuid.lower() for uuid in getattr(adv, 'service_uuids', [])}
+                if services & {_SW2_SERVICE_UUID, _CONTROL_SERVICE_UUID}:
+                    return True
+                name = (getattr(adv, 'local_name', None) or d.name or "").lower()
             if name == "devicename" or any(
                     p.lower() in name for p in _NINTENDO_NAME_PATTERNS):
                 return True

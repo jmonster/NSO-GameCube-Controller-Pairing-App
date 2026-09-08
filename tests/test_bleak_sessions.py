@@ -33,6 +33,7 @@ class BleakSessionTests(unittest.IsolatedAsyncioTestCase):
         self.fail_notify = False
         self.connect_gate = None
         self.advertisements = []
+        self.advertisement_details = {}
         test = self
 
         class Client:
@@ -83,8 +84,11 @@ class BleakSessionTests(unittest.IsolatedAsyncioTestCase):
             async def start(self):
                 self.started.set()
                 for addr in test.advertisements:
-                    self.callback(types.SimpleNamespace(address=addr, name='Nintendo'),
-                                  types.SimpleNamespace(rssi=-40, manufacturer_data={}, service_uuids=[]))
+                    name, manufacturer, services, local_name = test.advertisement_details.get(
+                        addr, ('Nintendo', {}, [], None))
+                    self.callback(types.SimpleNamespace(address=addr, name=name),
+                                  types.SimpleNamespace(rssi=-40, manufacturer_data=manufacturer,
+                                                        service_uuids=services, local_name=local_name))
 
             async def stop(self):
                 self.stopped += 1
@@ -265,3 +269,25 @@ class BleakSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.connect())
         self.assertEqual(len(self.clients), 1)
         self.assertEqual(self.clients[0].disconnect_count, 0)
+
+    async def test_discovery_uses_bluetooth_company_not_usb_vid_or_unrelated_company(self):
+        self.advertisements = ['nintendo', 'old-incorrect-id', 'usb-vid']
+        for addr, company in zip(self.advertisements, (0x0553, 0x037E, 0x057E)):
+            self.advertisement_details[addr] = (None, {company: b'\x01'}, [], None)
+        self.backend._connect_and_init = AsyncMock(return_value=None)
+        await self.backend.scan_and_connect(0, self.data, self.status.append, self.disconnected,
+                                            scan_timeout=0)
+        self.assertEqual([c.args[0] for c in self.backend._connect_and_init.call_args_list],
+                         ['NINTENDO'])
+
+    async def test_discovery_accepts_service_uuid_and_scan_response_local_name(self):
+        self.advertisements = ['service-only', 'response-name']
+        self.advertisement_details = {
+            'service-only': (None, {}, [SW2.upper()], None),
+            'response-name': (None, {}, [], 'Nintendo GameCube'),
+        }
+        self.backend._connect_and_init = AsyncMock(return_value=None)
+        await self.backend.scan_and_connect(0, self.data, self.status.append, self.disconnected,
+                                            scan_timeout=0)
+        self.assertEqual({c.args[0] for c in self.backend._connect_and_init.call_args_list},
+                         {'SERVICE-ONLY', 'RESPONSE-NAME'})
