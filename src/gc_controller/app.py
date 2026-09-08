@@ -186,15 +186,10 @@ class GCControllerEnabler:
         if 'device_links' not in self.slot_calibrations[0]:
             self.slot_calibrations[0]['device_links'] = {}
 
-        # Clear stale BLE slot_assignments from previous sessions.
-        # On macOS, CoreBluetooth UUIDs are session-dependent and can change,
-        # so persisting them across restarts causes wrong slot assignments.
-        # Within a session, assignments are re-created as controllers connect,
-        # preserving slot stability for disconnect/reconnect cycles.
-        assignments = self.slot_calibrations[0]['slot_assignments']
-        stale_ble = [k for k in assignments if k.startswith('ble:')]
-        for k in stale_ble:
-            del assignments[k]
+        # Keep saved USB and BLE player assignments across restarts. A
+        # CoreBluetooth identifier is host-specific, not process-specific.
+        # A stale identifier should be handled by reconnect/forget, never by
+        # deleting all BLE preferences on every platform at startup.
 
         # Propagate per-slot global settings from slot 0 to all other slots
         for key in ('trigger_bump_100_percent', 'emulation_mode', 'stick_deadzone',
