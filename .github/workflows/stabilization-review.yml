@@ -1,0 +1,111 @@
+name: Temporary stabilization review
+
+# Temporary integration tooling; remove before merge. Fork code is never executed.
+on:
+  push:
+    branches: [stabilize/controller-sessions-and-macos]
+    paths: ['.github/workflows/stabilization-review.yml', '_stabilization/**']
+permissions:
+  contents: read
+concurrency:
+  group: stabilization-review
+  cancel-in-progress: false
+jobs:
+  inspect-forks:
+    if: github.repository == 'jmonster/NSO-GameCube-Controller-Pairing-App'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Collect public fork branches without checking out or executing them
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, re, subprocess, urllib.request
+          out = pathlib.Path('/tmp/fork-review'); out.mkdir()
+          def get(path):
+              request = urllib.request.Request('https://api.github.com/repos/' + path,
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+          def pages(path):
+              result = []
+              for page in range(1, 101):
+                  batch = get(path + '?per_page=100&page=' + str(page))
+                  result.extend(batch)
+                  if len(batch) < 100: return result
+              raise RuntimeError('Pagination limit exceeded')
+          upstream = 'RyanCopley/NSO-GameCube-Controller-Pairing-App'
+          pending = [upstream, 'MarcanBat2a/gamecube-remote-mac']
+          seen = set(); inventory = []; errors = []
+          while pending:
+              name = pending.pop(0)
+              if name in seen: continue
+              seen.add(name)
+              if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', name):
+                  raise ValueError('Invalid repository name')
+              try:
+                  repo = get(name)
+                  forks = pages(name + '/forks')
+                  pending.extend(f['full_name'] for f in forks)
+                  entry = {k: repo.get(k) for k in ('full_name', 'default_branch', 'fork', 'pushed_at', 'forks_count')}
+                  entry['parent'] = repo.get('parent', {}).get('full_name')
+                  entry['source'] = repo.get('source', {}).get('full_name')
+                  prefix = 'refs/remotes/review/' + name.replace('/', '__') + '/'
+                  subprocess.run(['git', 'fetch', '--no-tags', 'https://github.com/' + name + '.git',
+                                  '+refs/heads/*:' + prefix + '*'], check=True, timeout=120)
+                  refs = subprocess.check_output(['git', 'for-each-ref', '--format=%(refname) %(objectname)', prefix], text=True)
+                  entry['branches'] = []
+                  for row in refs.splitlines():
+                      ref, sha = row.split()
+                      commits = subprocess.check_output(['git', 'log', '--format=%H %s', 'HEAD..' + sha], text=True)
+                      entry['branches'].append({'ref': ref, 'sha': sha, 'unique_commits': commits.splitlines()})
+                  inventory.append(entry)
+              except Exception as exc:
+                  errors.append({'repo': name, 'error': str(exc)})
+          (out / 'inventory.json').write_text(json.dumps({'repositories': inventory, 'errors': errors}, indent=2))
+          subprocess.run(['git', 'bundle', 'create', str(out / 'repositories.bundle'), '--all'], check=True)
+          print(json.dumps({'repositories': inventory, 'errors': errors}, indent=2))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fork-review
+          path: /tmp/fork-review/
+          retention-days: 3
+  apply-reviewed-patches:
+    if: github.repository == 'jmonster/NSO-GameCube-Controller-Pairing-App'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - name: Apply patches, test, then publish without force
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          shopt -s nullglob
+          patches=(_stabilization/*.patch)
+          if (( ${#patches[@]} )); then
+            git am --exclude='.github/workflows/*' "${patches[@]}"
+            python -m unittest discover -s tests -v
+            python -m compileall -q src
+            git diff --check HEAD~${#patches[@]}
+            git rm -- "${patches[@]}"
+            git commit -m 'chore: remove applied integration patches'
+            remote=$(git ls-remote origin refs/heads/stabilize/controller-sessions-and-macos | cut -f1)
+            test "$remote" = "$GITHUB_SHA"
+            git push origin HEAD:refs/heads/stabilize/controller-sessions-and-macos
+          fi
