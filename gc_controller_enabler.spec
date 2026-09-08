@@ -154,6 +154,8 @@ hiddenimports = [
     'gc_controller.controller_ui',
     'gc_controller.input_processor',
     'gc_controller.ui_dispatch',
+    'gc_controller.process_io',
+    'gc_controller.package_smoke',
     'gc_controller.ble_identifiers',
     'gc_controller.ble.ipc',
     'gc_controller.ble.output',

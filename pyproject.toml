@@ -13,12 +13,16 @@ dependencies = [
     "customtkinter>=5.2.0",
     "Pillow>=9.0.0",
     "pystray>=0.19.0",
-    "vgamepad>=0.0.8; sys_platform == 'win32'",
+    "vgamepad @ git+https://github.com/yannbouteiller/vgamepad.git@3f910aa8bbde49a576683db74ad5e4a0879f8a80 ; sys_platform == 'win32'",
+    "bumble>=0.0.200; sys_platform == 'linux'",
     "evdev>=1.7.0; sys_platform == 'linux'",
     "bleak>=0.21.0; sys_platform == 'darwin'",
     "bleak>=0.21.0; sys_platform == 'win32'",
     "pyobjc-framework-Cocoa>=9.0; sys_platform == 'darwin'",
 ]
+
+[project.optional-dependencies]
+build = ["pyinstaller~=6.11.0"]
 
 [project.scripts]
 gc-controller = "gc_controller.app:main"

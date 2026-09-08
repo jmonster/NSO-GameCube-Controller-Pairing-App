@@ -16,6 +16,8 @@ def main():
         for path in sys.argv[1].split(os.pathsep):
             if path and path not in sys.path:
                 sys.path.insert(0, path)
+    from gc_controller.process_io import prepare_standard_streams
+    prepare_standard_streams(ipc=True)
     if sys.platform == 'win32':
         try:
             from bleak.backends.winrt.util import uninitialize_sta

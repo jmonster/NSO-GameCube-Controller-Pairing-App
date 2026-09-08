@@ -16,6 +16,8 @@ def main():
         for path in sys.argv[1].split(os.pathsep):
             if path and path not in sys.path:
                 sys.path.insert(0, path)
+    from gc_controller.process_io import prepare_standard_streams
+    prepare_standard_streams(ipc=True)
     try:
         from gc_controller.ble import find_hci_adapter
         from gc_controller.ble.bluez import BlueZLease

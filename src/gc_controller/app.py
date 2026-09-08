@@ -97,7 +97,7 @@ from .calibration import CalibrationManager
 from .connection_manager import ConnectionManager
 from .emulation_manager import EmulationManager, OutputStart
 from .input_processor import InputProcessor
-from .controller_slot import ControllerSlot, normalize_ble_address
+from .controller_slot import ControllerSlot
 from .ble.sw2_protocol import build_rumble_packet
 from .ui_dispatch import MainThreadDispatcher
 from .ble.ipc import read_event_stream
