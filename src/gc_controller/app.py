@@ -1905,32 +1905,16 @@ class GCControllerEnabler:
             _do_connect(slot_idx, hid_info)
 
     def _sync_player_leds(self):
-        """Re-send player LED commands to all connected USB controllers.
+        """Route LEDs through each slot's verified HID/USB device binding."""
 
-        Uses IOKit registry on macOS to correctly map each slot's HID device
-        to its USB device, ensuring LEDs match GUI slot numbers.
-        """
-        hid_to_bus = ConnectionManager.build_hid_to_usb_bus_map()
-        usb_devices = ConnectionManager.enumerate_usb_devices()
-        bus_to_usb = {u.bus: u for u in usb_devices}
 
         for slot_idx, slot in enumerate(self.slots):
-            if not slot.is_connected or not slot.device_path:
+            if not slot.is_connected or slot.connection_mode != 'usb':
+
+
                 continue
 
-            path_str = slot.device_path
-            if isinstance(path_str, bytes):
-                path_str = path_str.decode('utf-8', errors='replace')
-
-            try:
-                dev_srv_id = int(path_str.split(':')[1])
-            except (IndexError, ValueError):
-                continue
-
-            bus = hid_to_bus.get(dev_srv_id)
-            if bus is not None and bus in bus_to_usb:
-                ConnectionManager.set_player_led_usb(
-                    bus_to_usb[bus], slot_idx + 1)
+            slot.conn_mgr.set_player_led(slot_idx + 1)
 
     def _auto_connect_then_hotplug(self):
         """Run startup auto-connect, then start hotplug polling."""
