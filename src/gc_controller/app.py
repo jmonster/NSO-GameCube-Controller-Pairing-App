@@ -100,6 +100,7 @@ from .input_processor import InputProcessor
 from .controller_slot import ControllerSlot
 from .ble.sw2_protocol import build_rumble_packet
 from .ui_dispatch import MainThreadDispatcher
+from .usb_worker import USBService
 from .ble.ipc import read_event_stream
 from .ble.parent import CommandTransport
 from .ble.sessions import address as normalize_ble_address
@@ -191,6 +192,8 @@ class GCControllerEnabler:
                 for i in range(1, MAX_SLOTS):
                     self.slot_calibrations[i][key] = val
 
+        self._usb_service = USBService(ConnectionManager, self._call_on_ui_thread)
+
         # Create slots (each with own managers)
         self.slots: list[ControllerSlot] = []
         for i in range(MAX_SLOTS):
@@ -203,8 +206,12 @@ class GCControllerEnabler:
                 on_error=lambda msg, idx=i: self._call_on_ui_thread(
                     self.ui.update_status, idx, msg),
                 on_disconnect=lambda idx=i: self._call_on_ui_thread(
-                    self._on_unexpected_disconnect, idx),
+                    self._on_unexpected_disconnect, idx, self.slots[idx].input_proc.reader_token),
             )
+            slot.conn_mgr = self._usb_service.connection(
+                on_status=lambda msg, idx=i: self.ui.update_status(idx, msg),
+                on_progress=lambda val: None,
+                on_failure=lambda idx=i: self._on_unexpected_disconnect(idx))
             self.slots.append(slot)
 
         # Per-slot latest UI data — written by input threads, read by poll timer.
@@ -445,12 +452,14 @@ class GCControllerEnabler:
         preferred = self._resolve_slot_for_device(device_identity)
         if preferred is not None and preferred not in exclude:
             slot = self.slots[preferred]
-            if not slot.is_connected:
+            if (not slot.is_connected and slot.usb_pending is None
+                    and preferred not in self._ble_pair_mode):
                 return preferred
 
         # Fallback: first free slot
         for i in range(MAX_SLOTS):
-            if i not in exclude and not self.slots[i].is_connected:
+            if (i not in exclude and i not in self._ble_pair_mode
+                    and not self.slots[i].is_connected and self.slots[i].usb_pending is None):
                 return i
 
         return -1
@@ -466,14 +475,14 @@ class GCControllerEnabler:
         Returns None if every slot is occupied.
         """
         preferred = self._resolve_slot_for_device(device_identity)
-        if preferred is not None and not self.slots[preferred].is_connected:
+        if preferred is not None and not self.slots[preferred].is_connected and self.slots[preferred].usb_pending is None:
             return preferred
 
-        if not self.slots[subprocess_slot].is_connected:
+        if not self.slots[subprocess_slot].is_connected and self.slots[subprocess_slot].usb_pending is None:
             return subprocess_slot
 
         for i in range(MAX_SLOTS):
-            if not self.slots[i].is_connected:
+            if not self.slots[i].is_connected and self.slots[i].usb_pending is None:
                 return i
 
         return None
@@ -481,64 +490,108 @@ class GCControllerEnabler:
     # ── Connection ───────────────────────────────────────────────────
 
     def connect_controller(self, slot_index: int):
-        """Connect to GameCube controller on a specific slot."""
+        """Reserve a slot, then scan/open without any hardware calls on Tk."""
         slot = self.slots[slot_index]
-        sui = self.ui.slots[slot_index]
-
-        if slot.is_connected:
-            logger.info("Slot %d: disconnecting (toggle)", slot_index)
+        if slot.is_connected or slot.usb_pending is not None:
             self.disconnect_controller(slot_index)
             return
-
-        # Enumerate available HID devices
-        all_hid = ConnectionManager.enumerate_devices()
-        logger.debug("Slot %d: found %d HID device(s)", slot_index, len(all_hid))
-
-        # Filter out paths already claimed by other slots (USB only)
-        claimed_paths = set()
-        for i, s in enumerate(self.slots):
-            if (i != slot_index and s.is_connected
-                    and s.connection_mode == 'usb' and s.conn_mgr.device_path):
-                claimed_paths.add(s.conn_mgr.device_path)
-
-        # Auto — pick first unclaimed
-        available = [d for d in all_hid if d['path'] not in claimed_paths]
-        if not available:
-            self.ui.update_status(slot_index, t("ui.no_unclaimed"))
+        if slot_index in self._ble_pair_mode or getattr(self, '_shutdown_started', False):
             return
-        target_info = available[0]
-        target_path = target_info['path']
+        token = object()
+        slot.usb_pending = token
+        self.ui.slots[slot_index].connect_btn.configure(text=t("btn.cancel"))
+        if self.ui.slots[slot_index].pair_btn:
+            self.ui.slots[slot_index].pair_btn.configure(state='disabled')
+        def found(devices, error):
+            if slot.usb_pending is not token:
+                return
+            claimed = self._usb_claimed_paths()
+            available = [d for d in devices if d.get('path') and d['path'] not in claimed]
+            if error or not available:
+                self._usb_connect_done(slot_index, token, None, False, False, False)
+                self.ui.update_status(slot_index, error or t("ui.no_unclaimed"))
+                return
+            self._queue_usb_open(slot_index, available[0], token=token, calibrate=True)
+        if not self._usb_service.scan(('manual', slot_index), found):
+            self._usb_connect_done(slot_index, token, None, False, False, False)
 
-        # Open specific HID device by path
-        if not slot.conn_mgr.connect_hid(device_path=target_path):
-            return
 
-        slot.device_path = target_path
-        slot.connection_mode = 'usb'
+    def _usb_claimed_paths(self):
+        return {path for slot in self.slots
+                for path in (slot.conn_mgr.device_path, getattr(slot, 'usb_pending_path', None)) if path}
 
-        # Build device identity and persist slot assignment
-        dev_id = make_usb_device_identity(target_info)
-        slot.device_identity = dev_id
-        self._save_slot_assignment(dev_id, slot_index)
 
-        # Save the path as the preferred device for this slot (runtime only)
-        path_str = target_path.decode('utf-8', errors='replace')
-        self.slot_calibrations[slot_index]['preferred_device_path'] = path_str
+    def _cancel_usb_pending(self, slot_index):
+        slot = self.slots[slot_index]
+        slot.usb_pending = None
+        slot.usb_pending_path = None
+        self._usb_service.cancel_scan(('manual', slot_index))
+        self._usb_service.cancel_scan(('reconnect', slot_index))
 
-        slot.input_proc.start()
 
-        sui.connect_btn.configure(text=t("ui.disconnect_usb"))
+    def _queue_usb_open(self, slot_index, info, *, token=None, emulate=True, calibrate=False):
+        slot = self.slots[slot_index]
+        if token is None:
+            if slot.is_connected or slot.usb_pending is not None or slot_index in self._ble_pair_mode:
+                return False
+            token = object()
+            slot.usb_pending = token
+        if slot.usb_pending is not token or slot.is_connected or getattr(self, '_shutdown_started', False):
+            return False
+        slot.usb_pending_path = info['path']
+        sui = self.ui.slots[slot_index]
+        sui.connect_btn.configure(text=t("btn.cancel"))
         if sui.pair_btn:
             sui.pair_btn.configure(state='disabled')
-        self.ui.update_tab_status(
-            slot_index, connected=True, emulating=False, connection_mode='usb')
-        self.toggle_emulation(slot_index)
+        def complete(success):
+            self._usb_connect_done(slot_index, token, info, success, emulate, calibrate)
+        if not slot.conn_mgr.connect_async(info['path'], complete):
+            complete(False)
+            return False
+        return True
+
+
+    def _usb_connect_done(self, slot_index, token, info, success, emulate, calibrate):
+        slot = self.slots[slot_index]
+        if slot.usb_pending is not token or getattr(self, '_shutdown_started', False):
+            return
+        slot.usb_pending = None
+        slot.usb_pending_path = None
+        sui = self.ui.slots[slot_index]
+        if not success or slot.is_connected:
+            slot.conn_mgr.disconnect()
+            sui.connect_btn.configure(text=t("ui.connect_usb"))
+            if sui.pair_btn:
+                sui.pair_btn.configure(state='normal')
+            return
+        path = info['path']
+        slot.device_path = path
+        slot.connection_mode = 'usb'
+        slot.device_identity = make_usb_device_identity(info)
+        self._save_slot_assignment(slot.device_identity, slot_index)
+        self.slot_calibrations[slot_index]['preferred_device_path'] = path.decode('utf-8', errors='replace')
+        try:
+            slot.input_proc.start()
+        except Exception as exc:
+            slot.conn_mgr.disconnect()
+            self.ui.update_status(slot_index, f'USB input could not start: {exc}')
+            sui.connect_btn.configure(text=t("ui.connect_usb"))
+            if sui.pair_btn:
+                sui.pair_btn.configure(state='normal')
+            return
+        sui.connect_btn.configure(text=t("ui.disconnect_usb"))
+        self.ui.update_tab_status(slot_index, connected=True, emulating=False, connection_mode='usb')
+        if emulate:
+            self.toggle_emulation(slot_index)
+        slot.reconnect_was_emulating = False
         self._sync_player_leds()
         self._check_dual_connection(slot_index)
-
-        if self._needs_calibration(slot_index):
+        self._recent_usb_hotplug[slot_index] = (time.monotonic(), slot.device_identity)
+        if calibrate and self._needs_calibration(slot_index):
             self.ui.update_status(slot_index, t("ui.new_controller_cal"))
-            self.root.after(500, lambda si=slot_index: self._start_auto_calibration(si))
+            device = slot.conn_mgr.device
+            self.root.after(500, lambda: self._start_auto_calibration(slot_index)
+                            if slot.conn_mgr.device is device else None)
 
     def _reset_rumble(self, slot_index: int):
         """Send rumble OFF if currently ON and reset rumble state."""
@@ -553,6 +606,8 @@ class GCControllerEnabler:
         """Disconnect from controller on a specific slot."""
         slot = self.slots[slot_index]
         sui = self.ui.slots[slot_index]
+
+        self._cancel_usb_pending(slot_index)
 
         # Stop live trigger display and cancel in-progress calibration
         self._stop_trigger_cal_live(slot_index)
@@ -972,7 +1027,7 @@ class GCControllerEnabler:
         # Redirect to the first available slot
         target_slot = None
         for i in range(MAX_SLOTS):
-            if not self.slots[i].is_connected and i not in self._ble_pair_mode:
+            if not self.slots[i].is_connected and self.slots[i].usb_pending is None and i not in self._ble_pair_mode:
                 target_slot = i
                 break
         if target_slot is None:
@@ -1140,13 +1195,8 @@ class GCControllerEnabler:
 
             # Clear leftover USB state so hotplug doesn't think
             # this slot still claims a USB path.
-            if slot.conn_mgr.device:
-                try:
-                    slot.conn_mgr.device.close()
-                except Exception:
-                    pass
-                slot.conn_mgr.device = None
-            slot.conn_mgr.device_path = None
+            self._cancel_usb_pending(slot_index)
+            slot.conn_mgr.disconnect()
             slot.device_path = None
 
             slot.ble_connected = True
@@ -1483,7 +1533,7 @@ class GCControllerEnabler:
     def _pick_auto_scan_slot(self):
         """Pick the first free slot for auto-scan. Returns slot index or None."""
         for i in range(MAX_SLOTS):
-            if (not self.slots[i].is_connected
+            if (not self.slots[i].is_connected and self.slots[i].usb_pending is None
                     and i not in self._ble_pair_mode):
                 return i
         return None
@@ -1565,13 +1615,8 @@ class GCControllerEnabler:
 
         # Clear leftover USB state so hotplug doesn't think
         # this slot still claims a USB path.
-        if slot.conn_mgr.device:
-            try:
-                slot.conn_mgr.device.close()
-            except Exception:
-                pass
-            slot.conn_mgr.device = None
-        slot.conn_mgr.device_path = None
+        self._cancel_usb_pending(slot_index)
+        slot.conn_mgr.disconnect()
         slot.device_path = None
 
         slot.ble_connected = True
@@ -1721,6 +1766,9 @@ class GCControllerEnabler:
         # Slot already reconnected via another transport (e.g. USB) — abort.
         if slot.is_connected:
             return
+        if slot.usb_pending is not None:
+            self.root.after(3000, lambda: self._attempt_ble_reconnect(slot_index))
+            return
 
         # User clicked disconnect while we were waiting — abort
         if slot.input_proc.stop_event.is_set():
@@ -1798,13 +1846,8 @@ class GCControllerEnabler:
 
         # Clear leftover USB state so hotplug doesn't think
         # this slot still claims a USB path.
-        if slot.conn_mgr.device:
-            try:
-                slot.conn_mgr.device.close()
-            except Exception:
-                pass
-            slot.conn_mgr.device = None
-        slot.conn_mgr.device_path = None
+        self._cancel_usb_pending(slot_index)
+        slot.conn_mgr.disconnect()
         slot.device_path = None
 
         slot.ble_connected = True
@@ -1827,76 +1870,41 @@ class GCControllerEnabler:
             self.toggle_emulation(slot_index)
 
     def auto_connect_and_emulate(self):
-        """Auto-connect all available controllers and start emulation.
+        """Scan once on the discovery worker; reserve preferred slots before opens."""
+        self._usb_service.scan('startup', lambda devices, error:
+                               self._connect_usb_snapshot(devices) if not error else None)
 
-        Respects persistent slot_assignments: if a device has a saved slot
-        preference, it gets that slot.  Falls back to preferred_device_path
-        and then first-come-first-served.
-        """
-        all_hid = ConnectionManager.enumerate_devices()
-        if not all_hid:
+
+    def _connect_usb_snapshot(self, devices):
+        if getattr(self, '_shutdown_started', False):
             return
-
-        claimed_paths = {s.conn_mgr.device_path for s in self.slots
-                         if s.is_connected and s.connection_mode == 'usb'}
-        claimed_slots = {i for i, s in enumerate(self.slots) if s.is_connected}
-
-        def _do_connect(slot_idx, hid_info):
-            path = hid_info['path']
-            slot = self.slots[slot_idx]
-            sui = self.ui.slots[slot_idx]
-            if slot.conn_mgr.connect_hid(device_path=path):
-                claimed_paths.add(path)
+        claimed = self._usb_claimed_paths()
+        claimed_slots = {i for i, s in enumerate(self.slots)
+                         if s.is_connected or s.usb_pending is not None or i in self._ble_pair_mode}
+        def queue(slot_idx, info):
+            if self._queue_usb_open(slot_idx, info):
+                claimed.add(info['path'])
                 claimed_slots.add(slot_idx)
-                slot.device_path = path
-                slot.connection_mode = 'usb'
-                dev_id = make_usb_device_identity(hid_info)
-                slot.device_identity = dev_id
-                self._save_slot_assignment(dev_id, slot_idx)
-                path_str = path.decode('utf-8', errors='replace')
-                self.slot_calibrations[slot_idx]['preferred_device_path'] = path_str
-                slot.input_proc.start()
-                sui.connect_btn.configure(text=t("ui.disconnect_usb"))
-                if sui.pair_btn:
-                    sui.pair_btn.configure(state='disabled')
-                self.ui.update_tab_status(
-                    slot_idx, connected=True, emulating=False, connection_mode='usb')
-                self.toggle_emulation(slot_idx)
-                return True
-            return False
-
-        # First pass: assign devices to their persisted slots
-        for hid_info in all_hid:
-            dev_id = make_usb_device_identity(hid_info)
-            preferred = self._resolve_slot_for_device(dev_id)
+        for info in devices:
+            if not info.get('path') or info['path'] in claimed:
+                continue
+            preferred = self._resolve_slot_for_device(make_usb_device_identity(info))
             if preferred is not None and preferred not in claimed_slots:
-                if not self.slots[preferred].is_connected:
-                    if hid_info['path'] not in claimed_paths:
-                        _do_connect(preferred, hid_info)
-
-        # Second pass (legacy): preferred_device_path for devices without
-        # a slot_assignments entry yet
+                queue(preferred, info)
         for i in range(MAX_SLOTS):
-            if i in claimed_slots or self.slots[i].is_connected:
+            if i in claimed_slots:
                 continue
-            saved = self.slot_calibrations[i].get('preferred_device_path', '')
-            if not saved:
-                continue
-            pref_bytes = saved.encode('utf-8')
-            for hid_info in all_hid:
-                if hid_info['path'] == pref_bytes and pref_bytes not in claimed_paths:
-                    _do_connect(i, hid_info)
+            saved = self.slot_calibrations[i].get('preferred_device_path', '').encode('utf-8')
+            for info in devices:
+                if saved and info.get('path') == saved and saved not in claimed:
+                    queue(i, info)
                     break
-
-        # Third pass: fill remaining slots with unclaimed devices (FCFS)
-        for hid_info in all_hid:
-            if hid_info['path'] in claimed_paths:
+        for info in devices:
+            if not info.get('path') or info['path'] in claimed:
                 continue
-            dev_id = make_usb_device_identity(hid_info)
-            slot_idx = self._find_slot_for_device(dev_id, exclude_slots=claimed_slots)
-            if slot_idx < 0:
-                break
-            _do_connect(slot_idx, hid_info)
+            idx = self._find_slot_for_device(make_usb_device_identity(info), exclude_slots=claimed_slots)
+            if idx >= 0:
+                queue(idx, info)
 
     def _sync_player_leds(self):
         """Route LEDs through each slot's verified HID/USB device binding."""
@@ -1933,150 +1941,72 @@ class GCControllerEnabler:
     # ── USB hotplug polling ────────────────────────────────────────
 
     def _start_usb_hotplug(self):
-        """Begin periodic USB enumeration to detect newly plugged controllers."""
+        """Only one worker scans; schedule the next poll after a result arrives."""
         if self._usb_hotplug_active:
             return
-        self._last_seen_usb_paths = {
-            d['path'] for d in ConnectionManager.enumerate_devices()
-        }
         self._usb_hotplug_active = True
-        self._usb_hotplug_timer_id = self.root.after(
-            2000, self._usb_hotplug_tick)
+        self._usb_hotplug_epoch = object()
+        self._usb_hotplug_tick()
 
     def _stop_usb_hotplug(self):
-        """Stop USB hotplug polling."""
         self._usb_hotplug_active = False
+        self._usb_hotplug_epoch = None
+        self._usb_service.cancel_scan('hotplug')
+        self._usb_service.cancel_scan('startup')
         if self._usb_hotplug_timer_id is not None:
             self.root.after_cancel(self._usb_hotplug_timer_id)
             self._usb_hotplug_timer_id = None
 
     def _usb_hotplug_tick(self):
-        """Periodic check for newly connected USB controllers."""
         self._usb_hotplug_timer_id = None
         if not self._usb_hotplug_active:
             return
-
-        try:
-            current_paths = {
-                d['path'] for d in ConnectionManager.enumerate_devices()
-            }
-        except Exception:
-            current_paths = set()
-
-        new_paths = current_paths - self._last_seen_usb_paths
-        self._last_seen_usb_paths = current_paths
-
-        if new_paths:
-            self._auto_connect_new_usb(new_paths)
-
-        if self._usb_hotplug_active:
-            self._usb_hotplug_timer_id = self.root.after(
-                2000, self._usb_hotplug_tick)
+        epoch = self._usb_hotplug_epoch
+        def found(devices, error):
+            if not self._usb_hotplug_active or self._usb_hotplug_epoch is not epoch:
+                return
+            if not error:
+                paths = {d['path'] for d in devices if d.get('path')}
+                new_paths = paths - self._last_seen_usb_paths
+                self._last_seen_usb_paths = paths
+                self._connect_usb_snapshot([d for d in devices if d.get('path') in new_paths])
+            # A scan error is not evidence of unplugging every controller.
+            self._usb_hotplug_timer_id = self.root.after(2000, self._usb_hotplug_tick)
+        if not self._usb_service.scan('hotplug', found):
+            self._usb_hotplug_timer_id = self.root.after(2000, self._usb_hotplug_tick)
 
     def _auto_connect_new_usb(self, new_paths: set):
-        """Auto-connect newly detected USB controllers to free slots."""
-        claimed_paths = set()
-        for s in self.slots:
-            if s.is_connected and s.connection_mode == 'usb' and s.conn_mgr.device_path:
-                claimed_paths.add(s.conn_mgr.device_path)
-
-        unclaimed = new_paths - claimed_paths
-        if not unclaimed:
-            return
-
-        # Re-enumerate to get full HID info dicts for identity building
-        all_hid = ConnectionManager.enumerate_devices()
-        path_to_info = {d['path']: d for d in all_hid}
-
-        for path in unclaimed:
-            hid_info = path_to_info.get(path, {'path': path})
-            dev_id = make_usb_device_identity(hid_info)
-            slot_index = self._find_slot_for_device(dev_id)
-            if slot_index < 0:
-                break
-
-            slot = self.slots[slot_index]
-            sui = self.ui.slots[slot_index]
-
-            if slot.conn_mgr.connect_hid(device_path=path):
-                slot.device_path = path
-                slot.connection_mode = 'usb'
-                slot.device_identity = dev_id
-                self._save_slot_assignment(dev_id, slot_index)
-                self.slot_calibrations[slot_index]['preferred_device_path'] = \
-                    path.decode('utf-8', errors='replace')
-                slot.input_proc.start()
-                sui.connect_btn.configure(text=t("ui.disconnect_usb"))
-                if sui.pair_btn:
-                    sui.pair_btn.configure(state='disabled')
-                self.ui.update_tab_status(
-                    slot_index, connected=True, emulating=False, connection_mode='usb')
-                self.toggle_emulation(slot_index)
-                self._sync_player_leds()
-                self._recent_usb_hotplug[slot_index] = (time.monotonic(), dev_id)
-                logger.info("USB hotplug: slot %d auto-connected (id=%s)",
-                            slot_index, dev_id)
+        self._usb_service.scan('new-paths', lambda devices, error:
+            self._connect_usb_snapshot([d for d in devices if d.get('path') in new_paths])
+            if not error else None)
 
     # ── Debug helpers ─────────────────────────────────────────────
 
-    @staticmethod
-    def _log_all_hid_gamepads(context: str = ""):
-        """Enumerate ALL HID gamepads on the system for debugging."""
-        try:
-            all_devs = hid.enumerate(0, 0)
-            gamepads = [d for d in all_devs
-                        if d.get('usage_page') == 0x0001
-                        and d.get('usage') in (0x04, 0x05)]
-            logger.info("HID gamepads on system (%s): %d found",
-                        context, len(gamepads))
-            for d in gamepads:
-                logger.info("  vid=%04X pid=%04X product=%s path=%s",
-                            d.get('vendor_id', 0), d.get('product_id', 0),
-                            d.get('product_string', '?'),
-                            d.get('path', b'?'))
-        except Exception as e:
-            logger.debug("Failed to enumerate HID gamepads: %s", e)
+    def _log_all_hid_gamepads(self, context: str = ""):
+        """Diagnostics share the discovery worker; never enumerate on Tk."""
+        if logger.isEnabledFor(logging.DEBUG):
+            self._usb_service.scan('diagnostic', lambda devices, error:
+                logger.debug('GC HID snapshot (%s): %d devices, error=%s', context, len(devices), error))
 
     # ── Rapid USB scan after BLE disconnect ───────────────────────
 
-    def _start_rapid_usb_scan(self, ble_slot: int,
-                               attempts_left: int = 16):
-        """Rapidly enumerate USB after BLE disconnect to minimise the
-        window where Windows processes the controller as a native gamepad.
-
-        Runs every 300 ms for ~5 s.  Stops early if the slot reconnects
-        (via this scan, normal hotplug, or BLE reconnect).
-        """
+    def _start_rapid_usb_scan(self, ble_slot: int, attempts_left: int = 16):
         slot = self.slots[ble_slot]
-        if slot.is_connected or attempts_left <= 0:
+        if slot.is_connected or attempts_left <= 0 or getattr(self, '_shutdown_started', False):
             return
-
-        try:
-            current_paths = {
-                d['path'] for d in ConnectionManager.enumerate_devices()
-            }
-        except Exception:
-            current_paths = set()
-
-        new_paths = current_paths - self._last_seen_usb_paths
-        if new_paths:
-            self._last_seen_usb_paths = current_paths
-            self._auto_connect_new_usb(new_paths)
-
-            self._try_cross_transport_migration(ble_slot)
-            if slot.is_connected:
-                logger.info("Rapid USB scan: slot %d reconnected via USB "
-                            "after BLE disconnect", ble_slot)
-                self._log_all_hid_gamepads("after BLE→USB migration")
-                sui = self.ui.slots[ble_slot]
-                self.ui.update_ble_status(ble_slot, "")
-                if sui.pair_btn:
-                    sui.pair_btn.configure(state='disabled')
+        identity = slot.device_identity
+        def found(devices, error):
+            if (slot.is_connected or slot.device_identity != identity or
+                    slot.input_proc.stop_event.is_set() or getattr(self, '_shutdown_started', False)):
                 return
-
-        self.root.after(
-            300,
-            lambda: self._start_rapid_usb_scan(ble_slot, attempts_left - 1))
+            if not error:
+                paths = {d['path'] for d in devices if d.get('path')}
+                new_paths = paths - self._last_seen_usb_paths
+                self._last_seen_usb_paths = paths
+                self._connect_usb_snapshot([d for d in devices if d.get('path') in new_paths])
+                self._try_cross_transport_migration(ble_slot)
+            self.root.after(300, lambda: self._start_rapid_usb_scan(ble_slot, attempts_left - 1))
+        self._usb_service.scan(('rapid', ble_slot), found)
 
     # ── Cross-transport migration ─────────────────────────────────
 
@@ -2089,7 +2019,7 @@ class GCControllerEnabler:
         now = time.monotonic()
         ble_identity = self.slots[ble_slot].device_identity
         links = self.slot_calibrations[0].get('device_links', {})
-        if self.slots[ble_slot].is_connected or not ble_identity:
+        if self.slots[ble_slot].is_connected or getattr(self.slots[ble_slot], 'usb_pending', None) is not None or not ble_identity:
             return
 
         best_usb_slot = None
@@ -2179,105 +2109,49 @@ class GCControllerEnabler:
 
     # ── Auto-reconnect ──────────────────────────────────────────────
 
-    def _on_unexpected_disconnect(self, slot_index: int):
-        """Handle an unexpected controller disconnect on a specific slot."""
+    def _on_unexpected_disconnect(self, slot_index: int, reader_token=None):
         slot = self.slots[slot_index]
-        sui = self.ui.slots[slot_index]
-
-        if slot.conn_mgr.device:
-            try:
-                slot.conn_mgr.device.close()
-            except Exception:
-                pass
-            slot.conn_mgr.device = None
-
+        if reader_token is not None and (slot.input_proc.reader_token is not reader_token or
+                                         slot.input_proc.stop_event.is_set()):
+            return
+        if slot.ble_connected:
+            self._on_ble_disconnect(slot_index)
+            return
+        self._cancel_usb_pending(slot_index)
+        slot.conn_mgr.disconnect()
         slot.reconnect_was_emulating = slot.emu_mgr.is_emulating
-
         slot.stop_emulation()
-
         self.ui.update_status(slot_index, t("ui.disconnected_reconnecting"))
-        sui.connect_btn.configure(text=t("ui.connect_usb"))
-        if sui.pair_btn:
-            sui.pair_btn.configure(state='normal')
+        self.ui.slots[slot_index].connect_btn.configure(text=t("ui.connect_usb"))
         self.ui.update_tab_status(slot_index, connected=False, emulating=False)
-
         self._attempt_reconnect(slot_index)
 
     def _attempt_reconnect(self, slot_index: int):
-        """Try to reconnect controller on a specific slot. Retries every 2 seconds."""
         slot = self.slots[slot_index]
-        sui = self.ui.slots[slot_index]
-
-        # Slot already reconnected via another transport (e.g. BLE) — abort.
-        if slot.is_connected:
+        if slot.is_connected or getattr(self, '_shutdown_started', False) or slot.input_proc.stop_event.is_set():
             return
-
-        # User clicked Disconnect while we were waiting — abort.
-        if slot.input_proc.stop_event.is_set():
-            self.ui.update_status(slot_index, t("ui.ready"))
-            self.ui.reset_slot_ui(slot_index)
-            self.ui.update_tab_status(slot_index, connected=False, emulating=False)
+        if slot.usb_pending is not None or slot_index in self._ble_pair_mode:
+            self.root.after(2000, lambda: self._attempt_reconnect(slot_index))
             return
-
-        # Build set of paths claimed by other slots (USB only)
-        claimed_paths = set()
-        for i, s in enumerate(self.slots):
-            if (i != slot_index and s.is_connected
-                    and s.connection_mode == 'usb' and s.conn_mgr.device_path):
-                claimed_paths.add(s.conn_mgr.device_path)
-
-        all_hid = ConnectionManager.enumerate_devices()
-        all_paths = {d['path'] for d in all_hid}
-
-        # Priority order: remembered runtime path, then saved preferred path, then any unclaimed
-        target_path = None
-        candidates = []
-        if slot.device_path:
-            candidates.append(slot.device_path)
-        saved_pref = self.slot_calibrations[slot_index].get('preferred_device_path', '')
-        if saved_pref:
-            pref_bytes = saved_pref.encode('utf-8')
-            if pref_bytes not in candidates:
-                candidates.append(pref_bytes)
-
-        for candidate in candidates:
-            if candidate in all_paths and candidate not in claimed_paths:
-                target_path = candidate
-                break
-
-        if target_path is None:
-            for d in all_hid:
-                if d['path'] not in claimed_paths:
-                    target_path = d['path']
-                    break
-
-        if target_path:
-            # Init all USB devices
-            if slot.conn_mgr.connect_hid(device_path=target_path):
-                slot.device_path = target_path
-                slot.connection_mode = 'usb'
-                # Rebuild identity from full HID info if available
-                path_to_info = {d['path']: d for d in all_hid}
-                hid_info = path_to_info.get(target_path, {'path': target_path})
-                slot.device_identity = make_usb_device_identity(hid_info)
-                slot.input_proc.start()
-                sui.connect_btn.configure(text=t("ui.disconnect_usb"))
-                if sui.pair_btn:
-                    sui.pair_btn.configure(state='disabled')
-                self.ui.update_status(slot_index, t("ui.reconnected"))
-                self.ui.update_tab_status(
-                    slot_index, connected=True, emulating=False, connection_mode='usb')
-
-                self._sync_player_leds()
-
-                if slot.reconnect_was_emulating:
-                    slot.reconnect_was_emulating = False
-                    self.toggle_emulation(slot_index)
+        token = object()
+        slot.usb_pending = token
+        identity = slot.device_identity
+        def found(devices, error):
+            if slot.usb_pending is not token:
                 return
-
-        # Failed — retry after a delay
-        self.ui.update_status(slot_index, t("ui.disconnected_reconnecting"))
-        self.root.after(2000, lambda: self._attempt_reconnect(slot_index))
+            claimed = self._usb_claimed_paths()
+            # A reconnect cannot silently select a different unclaimed controller.
+            matches = [d for d in devices if d.get('path') not in claimed and
+                       make_usb_device_identity(d) == identity]
+            if not error and len(matches) == 1:
+                self._queue_usb_open(slot_index, matches[0], token=token,
+                                     emulate=slot.reconnect_was_emulating)
+            else:
+                slot.usb_pending = None
+            self.root.after(2000, lambda: self._attempt_reconnect(slot_index))
+        if not self._usb_service.scan(('reconnect', slot_index), found):
+            slot.usb_pending = None
+            self.root.after(2000, lambda: self._attempt_reconnect(slot_index))
 
     # ── Emulation ────────────────────────────────────────────────────
 
@@ -2935,6 +2809,8 @@ class GCControllerEnabler:
         if transport is not None:
             attempt(lambda: transport.close(wait=True))
         attempt(CommandTransport.close_all)
+        if hasattr(self, '_usb_service'):
+            attempt(self._usb_service.close)
         try:
             if reason:
                 self._messagebox.showerror('Controller service stopped', reason)

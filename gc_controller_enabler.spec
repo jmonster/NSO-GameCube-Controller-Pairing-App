@@ -150,6 +150,7 @@ hiddenimports = [
     'gc_controller.settings_storage',
     'gc_controller.calibration',
     'gc_controller.connection_manager',
+    'gc_controller.usb_worker',
     'gc_controller.emulation_manager',
     'gc_controller.controller_ui',
     'gc_controller.input_processor',

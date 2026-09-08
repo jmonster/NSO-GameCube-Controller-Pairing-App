@@ -189,6 +189,7 @@ class InputProcessor:
         self._ble_queue = ble_queue
 
         self.is_reading = False
+        self.reader_token = object()
         self.malformed_report_count = 0
         self._stop_event = threading.Event()
         self._read_thread: Optional[threading.Thread] = None
@@ -237,6 +238,7 @@ class InputProcessor:
             raise ValueError(f"Unknown input transport: {mode}")
         if mode == 'ble' and self._ble_queue is None:
             raise ValueError("BLE input requires a queue")
+        self.reader_token = object()
         self.is_reading = True
         self._stop_event.clear()
         self._raw_mins = None

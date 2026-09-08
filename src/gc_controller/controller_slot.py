@@ -38,6 +38,8 @@ class ControllerSlot:
         self.index = index
         self.calibration = calibration
         self.device_path: Optional[bytes] = None
+        self.usb_pending = None
+        self.usb_pending_path = None
         self.reconnect_was_emulating = False
         self._pipe_cancel = None
 

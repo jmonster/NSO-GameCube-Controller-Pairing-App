@@ -100,7 +100,8 @@ class ApplicationInitializationTests(TestCase):
                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)]
         self.assertNotIn('initialize_via_usb', calls)
         self.assertNotIn('enumerate_usb_devices', calls)
-        self.assertEqual(calls.count('connect_hid'), 6)
+        # GUI opens are asynchronous; only the two headless paths stay synchronous.
+        self.assertEqual(calls.count('connect_hid'), 2)
 
     def test_unknown_transport_pair_is_not_linked_by_connection_timing(self):
         method = load_definitions('app.py', {'_try_cross_transport_migration'},
