@@ -1,3 +1,4 @@
+import ntpath
 import os
 from pathlib import Path
 import stat
@@ -133,3 +134,28 @@ class DolphinFIFOTests(DolphinTestCase):
         os.environ['DOLPHIN_EMU_USERPATH'] = str(custom)
         with self.assertRaises(RuntimeError):
             self.functions()['ensure_dolphin_pipe']()
+
+
+class DolphinPathSemanticsTests(unittest.TestCase):
+    """Exercise Windows path semantics on every CI host, without filesystem IO."""
+
+    def get_dirs(self, platform, environ=None):
+        path_api = types.SimpleNamespace(join=ntpath.join, realpath=ntpath.normpath,
+                                         isdir=lambda path: False)
+        return load_definitions(
+            'virtual_gamepad.py', {'_get_all_dolphin_user_dirs'},
+            {'os': types.SimpleNamespace(path=path_api, environ=environ or {}),
+             'sys': types.SimpleNamespace(platform=platform),
+             '_REAL_HOME': r'C:\Users\runner',
+             '_FLATPAK_DOLPHIN_DATA': r'C:\Users\runner\flatpak'},
+        )['_get_all_dolphin_user_dirs']()
+
+    def test_macos_default_does_not_embed_posix_separators(self):
+        self.assertEqual(self.get_dirs('darwin'),
+                         [r'C:\Users\runner\Library\Application Support\Dolphin'])
+
+    def test_linux_default_does_not_embed_posix_separators(self):
+        for environ in ({}, {'XDG_DATA_HOME': ''}):
+            with self.subTest(environ=environ):
+                self.assertEqual(self.get_dirs('linux', environ),
+                                 [r'C:\Users\runner\.local\share\dolphin-emu'])

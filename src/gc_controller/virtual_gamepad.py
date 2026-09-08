@@ -649,10 +649,10 @@ def _get_all_dolphin_user_dirs() -> list[str]:
     if env_path:
         return [os.path.abspath(os.path.expanduser(env_path))]
     if sys.platform == 'darwin':
-        return [os.path.join(_REAL_HOME, 'Library/Application Support/Dolphin')]
+        return [os.path.join(_REAL_HOME, 'Library', 'Application Support', 'Dolphin')]
 
 
-    xdg_data = os.environ.get('XDG_DATA_HOME') or os.path.join(_REAL_HOME, '.local/share')
+    xdg_data = os.environ.get('XDG_DATA_HOME') or os.path.join(_REAL_HOME, '.local', 'share')
     default_dir = os.path.join(xdg_data, 'dolphin-emu')
     candidates = [_FLATPAK_DOLPHIN_DATA,
                   os.path.join(_REAL_HOME, '.dolphin-emu'), default_dir]
