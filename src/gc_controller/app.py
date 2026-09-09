@@ -18,6 +18,7 @@ import errno
 import json
 import logging
 import os
+import queue
 import shutil
 import signal
 import subprocess
@@ -45,6 +46,7 @@ from .controller_constants import (
 )
 from .i18n import t
 from .settings_manager import SettingsManager
+from .ble.reader import read_events, reap_helper
 
 # Rumble drive tuning. The controller's vibration command is binary and stops
 # on its own, so sustained rumble needs periodic re-sending and intensities
@@ -225,6 +227,12 @@ class GCControllerEnabler:
         # BLE state (lazy-initialized on first pair via privileged subprocess)
         self._ble_available = is_ble_available()
         self._ble_subprocess = None
+        self._ble_lock = threading.RLock()
+        self._ble_events = queue.Queue(maxsize=256)
+        self._ble_loss = None
+        self._ble_service_failed = False
+        self._ble_init_attempt = None
+        self._closing = False
         self._ble_reader_thread = None
         self._ble_stderr_thread = None
         self._ble_initialized = False
@@ -597,6 +605,9 @@ class GCControllerEnabler:
 
     def _start_ble_subprocess(self):
         """Start the BLE subprocess. Uses pkexec on Linux, direct spawn on macOS/Windows."""
+        with self._ble_lock:
+            if self._closing or self._ble_subprocess is not None:
+                raise RuntimeError("BLE helper already running or application closing")
         frozen = getattr(sys, 'frozen', False)
         if sys.platform == 'darwin' or sys.platform == 'win32':
             if frozen:
@@ -606,7 +617,7 @@ class GCControllerEnabler:
                     os.path.dirname(__file__), 'ble', 'bleak_subprocess.py')
                 python_path = os.pathsep.join(p for p in sys.path if p)
                 cmd = [sys.executable, script_path, python_path]
-            self._ble_subprocess = subprocess.Popen(
+            proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -620,111 +631,191 @@ class GCControllerEnabler:
                     os.path.dirname(__file__), 'ble', 'ble_subprocess.py')
                 python_path = os.pathsep.join(p for p in sys.path if p)
                 cmd = ['pkexec', sys.executable, script_path, python_path]
-            self._ble_subprocess = subprocess.Popen(
+            proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
 
+        with self._ble_lock:
+            if self._closing or self._ble_subprocess is not None:
+                reap_helper(proc)
+                raise RuntimeError("BLE startup was cancelled")
+            self._ble_subprocess = proc
+            self._ble_init_event = threading.Event()
+            self._ble_init_result = None
+            self._ble_loss = None
         self._ble_reader_thread = threading.Thread(
-            target=self._ble_event_reader, daemon=True)
+            target=self._ble_event_reader, args=(proc,), daemon=True)
         self._ble_reader_thread.start()
         self._ble_stderr_thread = threading.Thread(
-            target=self._ble_stderr_reader, daemon=True)
+            target=self._ble_stderr_reader, args=(proc,), daemon=True)
         self._ble_stderr_thread.start()
 
-    def _send_ble_cmd(self, cmd: dict):
-        """Send a JSON-line command to the BLE subprocess."""
-        if self._ble_subprocess and self._ble_subprocess.poll() is None:
+        return proc
+
+    def _send_ble_cmd(self, cmd: dict, proc=None):
+        """Keep a command bound to its original helper, including during init."""
+        proc = proc or self._ble_subprocess
+        if proc is not self._ble_subprocess:
+            return
+        if proc is not None and proc.poll() is None:
             try:
                 line = json.dumps(cmd, separators=(',', ':')) + '\n'
-                self._ble_subprocess.stdin.write(line.encode('utf-8'))
-                self._ble_subprocess.stdin.flush()
+                proc.stdin.write(line.encode('utf-8'))
+                proc.stdin.flush()
             except Exception:
                 pass
 
-    def _wait_ble_init(self, timeout: float) -> dict | None:
-        """Block until the next init event from the BLE subprocess."""
+    def _wait_ble_init(self, timeout: float, proc=None) -> dict | None:
+        """Wait only for the helper that owns this initialization attempt."""
+        proc = proc or self._ble_subprocess
+        wake = self._ble_init_event
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self._ble_subprocess and self._ble_subprocess.poll() is not None:
+            with self._ble_lock:
+                if self._ble_subprocess is not proc or self._closing:
+                    return None
+                if self._ble_loss is not None:
+                    return self._ble_init_result
+                if wake.is_set():
+                    wake.clear()
+                    return self._ble_init_result
+            if proc is None or proc.poll() is not None:
                 return None
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None
-            if self._ble_init_event.wait(timeout=min(remaining, 0.5)):
-                result = self._ble_init_result
-                self._ble_init_event.clear()
-                return result
+            wake.wait(timeout=min(max(0, deadline - time.monotonic()), 0.5))
         return None
 
-    def _cleanup_ble(self):
-        """Clean up BLE subprocess."""
-        if self._ble_subprocess:
-            try:
-                self._ble_subprocess.stdin.close()
-            except Exception:
-                pass
-            try:
-                self._ble_subprocess.terminate()
-                self._ble_subprocess.wait(timeout=3)
-            except Exception:
-                try:
-                    self._ble_subprocess.kill()
-                except Exception:
-                    pass
-            self._ble_subprocess = None
-        self._ble_initialized = False
-        self._ble_slot_remap.clear()
+    def _cleanup_ble(self, proc=None):
+        """Retire ownership before closing pipes so expected EOF is not a failure."""
+        with self._ble_lock:
+            if proc is not None and self._ble_subprocess is not proc:
+                return
+            proc, self._ble_subprocess = self._ble_subprocess, None
+            self._ble_initialized = False
+            self._ble_init_event.set()
+            self._ble_slot_remap.clear()
+            self._ble_loss = None
+        if proc is not None:
+            reap_helper(proc)
 
-    def _ble_event_reader(self):
-        """Read events from the BLE subprocess stdout (runs in a thread).
+    def _ble_event_reader(self, proc=None):
+        """Read the existing wire format; leave Tk work to its owner-thread poll."""
+        proc = proc or self._ble_subprocess
 
-        Handles two formats on the binary stdout stream:
-        - Binary data packets: 0xFF + slot(1) + payload(64) = 66 bytes
-        - JSON text lines: UTF-8 encoded, terminated by newline
-        """
-        try:
-            stdout = self._ble_subprocess.stdout
-            while True:
-                header = stdout.read(1)
-                if not header:
-                    break
-                if header[0] == 0xFF:
-                    packet = stdout.read(65)
-                    if len(packet) < 65:
-                        break
-                    si = self._ble_slot_remap.get(packet[0], packet[0])
-                    if 0 <= si < len(self.slots):
-                        self.slots[si].ble_data_queue.put(packet[1:65])
-                    continue
+        def on_data(si, data):
+            with self._ble_lock:
+                if self._ble_subprocess is proc and not self._closing and self._ble_loss is None:
+                    si = self._ble_slot_remap.get(si, si)
+                    self.slots[si].ble_data_queue.put_nowait(data)
 
-                rest = stdout.readline()
-                line = (header + rest).decode('utf-8', errors='replace').strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                etype = event.get('e')
-
-                if not self._ble_initialized and etype in (
+        def on_event(event):
+            with self._ble_lock:
+                if self._ble_subprocess is not proc or self._closing or self._ble_loss is not None:
+                    return
+                if not self._ble_initialized and event['e'] in (
                         'ready', 'bluez_stopped', 'open_ok', 'error'):
                     self._ble_init_result = event
                     self._ble_init_event.set()
-                    continue
+                else:
+                    self._ble_events.put_nowait((proc, event))
 
-                self.root.after(
-                    0, lambda ev=event: self._handle_ble_event(ev))
+        try:
+            read_events(proc.stdout, on_data, on_event)
+        except Exception as exc:
+            with self._ble_lock:
+                if self._ble_subprocess is proc and not self._closing and self._ble_loss is None:
+                    reason = 'BLE input/event queue full' if isinstance(exc, queue.Full) else str(exc)
+                    self._ble_loss = (proc, reason)
+                    self._ble_service_failed = True
+                    self._ble_initialized = False
+                    self._ble_init_result = {'e': 'error', 'msg': reason}
+                    self._ble_init_event.set()
+        finally:
+            proc.stdout.close()
+
+    def _poll_ble_events(self):
+        """Prioritize helper loss over queued events; never dispatch a retired owner."""
+        with self._ble_lock:
+            if self._ble_loss is not None:
+                self._on_ble_service_loss(*self._ble_loss)
+            for _ in range(32):
+                try:
+                    proc, event = self._ble_events.get_nowait()
+                except queue.Empty:
+                    break
+                if self._ble_subprocess is proc and not self._closing and self._ble_loss is None:
+                    try:
+                        self._handle_ble_event(event)
+                    except Exception:
+                        logger.exception("Could not apply BLE event")
+                        self._on_ble_service_loss(proc, "Could not apply BLE event")
+
+    def _on_ble_service_loss(self, proc, reason):
+        """Retire this helper's BLE slots, without reconnecting or touching USB."""
+        with self._ble_lock:
+            if self._ble_subprocess is not proc or self._closing:
+                return
+            self._ble_subprocess = None
+            self._ble_initialized = False
+            self._ble_loss = None
+            self._ble_service_failed = True
+            self._ble_init_attempt = None
+            self._ble_init_in_progress = False
+            pending_slots = set(self._ble_pair_mode)
+            self._ble_pair_mode.clear()
+            self._diff_scan_callback.clear()
+            self._scan_stream_callback.clear()
+            self._ble_known_scan_slot = None
+            self._ble_slot_remap.clear()
+            self._auto_scan_pending = False
+            self._auto_scan_slot = None
+        try:
+            self._stop_auto_scan()
         except Exception:
-            pass
+            logger.exception("Could not clear BLE scanning UI")
+        logger.warning("BLE helper lost: %s", reason)
+        for si, slot in enumerate(self.slots):
+            if slot.connection_mode != 'ble':
+                if si not in pending_slots or slot.conn_mgr.device is not None:
+                    continue
+            slot.ble_connected = False
+            slot.device_identity = None
+            slot.reconnect_was_emulating = False
+            slot.rumble_desired = 0.0
+            slot.rumble_state = False
+            slot.input_proc.stop_event.set()
+            cancel = getattr(slot, '_pipe_cancel', None)
+            if cancel is not None:
+                cancel.set()
+            # Neutralize before waiting for the input thread. Each step must run
+            # even if an earlier backend or UI operation fails.
+            for cleanup in (slot.emu_mgr.stop, slot.input_proc.stop,
+                            lambda: self._stop_rumble_pwm(si),
+                            lambda: self.ui.reset_slot_ui(si)):
+                try:
+                    cleanup()
+                except Exception:
+                    logger.exception("BLE slot cleanup failed")
+            while not slot.ble_data_queue.empty():
+                try:
+                    slot.ble_data_queue.get_nowait()
+                except queue.Empty:
+                    break
+            self._latest_ui_data[si] = None
+            try:
+                self.ui.update_status(si, "BLE service stopped. Pair again to retry.")
+                self.ui.update_tab_status(si, connected=False, emulating=False)
+                self.ui.slots[si].connect_btn.configure(state='normal')
+                if self.ui.slots[si].pair_btn:
+                    self.ui.slots[si].pair_btn.configure(text=t("ui.pair_wireless"), state='normal')
+            except Exception:
+                logger.exception("Could not reset disconnected BLE UI")
+        reap_helper(proc)
 
-    def _ble_stderr_reader(self):
+    def _ble_stderr_reader(self, proc):
         """Forward BLE subprocess stderr into the app logger."""
-        proc = self._ble_subprocess
         if not proc or not proc.stderr:
             return
         try:
@@ -809,6 +900,8 @@ class GCControllerEnabler:
         using Bleak/CoreBluetooth (no elevated privileges needed).
         Returns True on success.
         """
+        self._poll_ble_events()
+        self._ble_service_failed = False
         if self._ble_initialized:
             return True
 
@@ -826,38 +919,41 @@ class GCControllerEnabler:
             return False
 
         try:
-            self._start_ble_subprocess()
+            proc = self._start_ble_subprocess()
         except Exception as e:
             self._messagebox.showerror(
                 t("error.ble"), t("error.ble_start_failed", error=e))
             return False
 
         # Wait for subprocess to start (user authenticates via pkexec on Linux)
-        result = self._wait_ble_init(timeout=60)
+        result = self._wait_ble_init(proc=proc, timeout=60)
         if not result or result.get('e') != 'ready':
-            self._cleanup_ble()
+            self._cleanup_ble(proc)
             self._messagebox.showerror(
                 t("error.ble"), t("error.ble_auth_cancelled"))
             return False
 
         # Stop BlueZ (must release HCI adapter for Bumble)
-        self._send_ble_cmd({"cmd": "stop_bluez"})
-        result = self._wait_ble_init(timeout=15)
+        self._send_ble_cmd({"cmd": "stop_bluez"}, proc=proc)
+        result = self._wait_ble_init(proc=proc, timeout=15)
         if not result or result.get('e') != 'bluez_stopped':
-            self._cleanup_ble()
+            self._cleanup_ble(proc)
             return False
 
         # Open HCI adapter
-        self._send_ble_cmd({"cmd": "open"})
-        result = self._wait_ble_init(timeout=15)
+        self._send_ble_cmd({"cmd": "open"}, proc=proc)
+        result = self._wait_ble_init(proc=proc, timeout=15)
         if not result or result.get('e') == 'error':
             msg = result.get('msg', 'Unknown error') if result else 'Timeout'
-            self._cleanup_ble()
+            self._cleanup_ble(proc)
             self._messagebox.showerror(
                 t("error.ble"), t("error.ble_adapter", msg=msg))
             return False
 
-        self._ble_initialized = True
+        with self._ble_lock:
+            if self._ble_subprocess is not proc or self._ble_service_failed or self._closing:
+                return False
+            self._ble_initialized = True
         return True
 
     def _init_ble_async(self):
@@ -866,19 +962,22 @@ class GCControllerEnabler:
         On completion, posts _on_ble_init_complete() to the main thread.
         On Linux this triggers pkexec for elevated privileges.
         """
+        if self._ble_service_failed or self._closing:
+            return
         if self._ble_initialized or self._ble_init_in_progress:
             if self._ble_initialized:
                 self._start_auto_scan()
             return
 
         self._ble_init_in_progress = True
+        attempt = self._ble_init_attempt = object()
 
         def _bg_init():
             try:
                 success = self._init_ble_background()
-                self.root.after(0, lambda: self._on_ble_init_complete(success))
+                self.root.after(0, lambda: self._on_ble_init_complete(success, attempt))
             except Exception:
-                self.root.after(0, lambda: self._on_ble_init_complete(False))
+                self.root.after(0, lambda: self._on_ble_init_complete(False, attempt))
 
         threading.Thread(target=_bg_init, daemon=True).start()
 
@@ -891,43 +990,49 @@ class GCControllerEnabler:
             return False
 
         try:
-            self._start_ble_subprocess()
+            proc = self._start_ble_subprocess()
         except Exception:
             return False
 
         # Wait for subprocess to start
-        result = self._wait_ble_init(timeout=60)
+        result = self._wait_ble_init(proc=proc, timeout=60)
         if not result or result.get('e') != 'ready':
-            self._cleanup_ble()
+            self._cleanup_ble(proc)
             return False
 
         # Stop BlueZ (Linux only — must release HCI adapter for Bumble)
-        self._send_ble_cmd({"cmd": "stop_bluez"})
-        result = self._wait_ble_init(timeout=15)
+        self._send_ble_cmd({"cmd": "stop_bluez"}, proc=proc)
+        result = self._wait_ble_init(proc=proc, timeout=15)
         if not result or result.get('e') != 'bluez_stopped':
-            self._cleanup_ble()
+            self._cleanup_ble(proc)
             return False
 
         # Open HCI adapter
-        self._send_ble_cmd({"cmd": "open"})
-        result = self._wait_ble_init(timeout=15)
+        self._send_ble_cmd({"cmd": "open"}, proc=proc)
+        result = self._wait_ble_init(proc=proc, timeout=15)
         if not result or result.get('e') == 'error':
-            self._cleanup_ble()
+            self._cleanup_ble(proc)
             return False
 
-        self._ble_initialized = True
+        with self._ble_lock:
+            if self._ble_subprocess is not proc or self._ble_service_failed or self._closing:
+                return False
+            self._ble_initialized = True
         return True
 
-    def _on_ble_init_complete(self, success: bool):
-        """Handle completion of async BLE init on the main thread."""
+    def _on_ble_init_complete(self, success: bool, attempt):
+        """Handle only the still-current asynchronous initialization attempt."""
+        if self._ble_init_attempt is not attempt or self._closing:
+            return
         self._ble_init_in_progress = False
 
-        if success:
+        if success and self._ble_initialized and not self._ble_service_failed:
             self._ble_init_retry_count = 0
             self._start_auto_scan()
         else:
             self._ble_init_retry_count += 1
-            if self._ble_init_retry_count < 3 and self.slot_calibrations[0].get('auto_scan_ble', True):
+            if (not self._ble_service_failed and self._ble_init_retry_count < 3
+                    and self.slot_calibrations[0].get('auto_scan_ble', True)):
                 # Retry after 30s
                 self.root.after(30000, self._init_ble_async)
 
@@ -2774,6 +2879,7 @@ class GCControllerEnabler:
 
     def _ui_poll(self):
         """Main-thread timer: apply latest input data for each slot."""
+        self._poll_ble_events()
         for slot_index in range(MAX_SLOTS):
             data = self._latest_ui_data[slot_index]
             if data is not None:
@@ -2915,6 +3021,7 @@ class GCControllerEnabler:
 
     def _actual_quit(self):
         """Perform full application shutdown and destroy the window."""
+        self._closing = True
         # Stop USB hotplug polling
         self._stop_usb_hotplug()
 
@@ -2984,6 +3091,9 @@ class _BleHeadlessManager:
 
     def __init__(self):
         self._subprocess = None
+        self._lock = threading.RLock()
+        self._failure = None
+        self._stopping = False
         self._reader_thread = None
         self._initialized = False
         self._init_event = threading.Event()
@@ -2991,6 +3101,13 @@ class _BleHeadlessManager:
 
     def start_subprocess(self):
         """Start the BLE subprocess. Uses pkexec on Linux, direct spawn on macOS/Windows."""
+        with self._lock:
+            if self._subprocess is not None:
+                raise RuntimeError("BLE helper already running")
+            self._stopping = False
+            self._failure = None
+            self._init_result = None
+            self._init_event = threading.Event()
         frozen = getattr(sys, 'frozen', False)
         if sys.platform == 'darwin' or sys.platform == 'win32':
             if frozen:
@@ -3000,7 +3117,7 @@ class _BleHeadlessManager:
                     os.path.dirname(__file__), 'ble', 'bleak_subprocess.py')
                 python_path = os.pathsep.join(p for p in sys.path if p)
                 cmd = [sys.executable, script_path, python_path]
-            self._subprocess = subprocess.Popen(
+            proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -3014,36 +3131,48 @@ class _BleHeadlessManager:
                     os.path.dirname(__file__), 'ble', 'ble_subprocess.py')
                 python_path = os.pathsep.join(p for p in sys.path if p)
                 cmd = ['pkexec', sys.executable, script_path, python_path]
-            self._subprocess = subprocess.Popen(
+            proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
 
-    def send_cmd(self, cmd: dict):
+        with self._lock:
+            if self._stopping or self._subprocess is not None:
+                reap_helper(proc)
+                raise RuntimeError("BLE startup was cancelled")
+            self._subprocess = proc
+        return proc
+
+    def send_cmd(self, cmd: dict, proc=None):
         """Send a JSON-line command to the BLE subprocess."""
-        if self._subprocess and self._subprocess.poll() is None:
+        proc = proc or self._subprocess
+        if proc is not self._subprocess:
+            return
+        if proc is not None and proc.poll() is None:
             try:
                 line = json.dumps(cmd, separators=(',', ':')) + '\n'
-                self._subprocess.stdin.write(line.encode('utf-8'))
-                self._subprocess.stdin.flush()
+                proc.stdin.write(line.encode('utf-8'))
+                proc.stdin.flush()
             except Exception:
                 pass
 
-    def _wait_init(self, timeout: float) -> dict | None:
-        """Block until the next init event from the BLE subprocess."""
+    def _wait_init(self, timeout: float, proc=None) -> dict | None:
+        proc, wake = proc or self._subprocess, self._init_event
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self._subprocess and self._subprocess.poll() is not None:
+            with self._lock:
+                if self._subprocess is not proc or self._stopping:
+                    return None
+                if self._failure is not None:
+                    return {'e': 'error', 'msg': self._failure['msg']}
+                if wake.is_set():
+                    wake.clear()
+                    return self._init_result
+            if proc is None or proc.poll() is not None:
                 return None
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None
-            if self._init_event.wait(timeout=min(remaining, 0.5)):
-                result = self._init_result
-                self._init_event.clear()
-                return result
+            wake.wait(timeout=min(max(0, deadline - time.monotonic()), 0.5))
         return None
 
     def init_ble(self, on_data, on_event) -> bool:
@@ -3063,44 +3192,47 @@ class _BleHeadlessManager:
             return False
 
         try:
-            self.start_subprocess()
+            proc = self.start_subprocess()
         except Exception as e:
             print(f"BLE Error: Failed to start BLE service: {e}")
             return False
 
         # Start reader thread immediately so it can receive init-phase events
-        self.start_reader(on_data, on_event)
+        self.start_reader(on_data, on_event, proc=proc)
 
         # Wait for subprocess to start (user authenticates via pkexec)
-        result = self._wait_init(timeout=60)
+        result = self._wait_init(proc=proc, timeout=60)
         if not result or result.get('e') != 'ready':
-            self.shutdown()
+            self.shutdown(proc)
             print("BLE Error: BLE service failed to start. "
                   "Authentication may have been cancelled.")
             return False
 
         # Stop BlueZ (must release HCI adapter for Bumble)
-        self.send_cmd({"cmd": "stop_bluez"})
-        result = self._wait_init(timeout=15)
+        self.send_cmd({"cmd": "stop_bluez"}, proc=proc)
+        result = self._wait_init(proc=proc, timeout=15)
         if not result or result.get('e') != 'bluez_stopped':
-            self.shutdown()
+            self.shutdown(proc)
             print("BLE Error: Failed to stop BlueZ.")
             return False
 
         # Open HCI adapter
-        self.send_cmd({"cmd": "open"})
-        result = self._wait_init(timeout=15)
+        self.send_cmd({"cmd": "open"}, proc=proc)
+        result = self._wait_init(proc=proc, timeout=15)
         if not result or result.get('e') == 'error':
             msg = result.get('msg', 'Unknown error') if result else 'Timeout'
-            self.shutdown()
+            self.shutdown(proc)
             print(f"BLE Error: Failed to initialize BLE: {msg}")
             print("Make sure a Bluetooth adapter is connected.")
             return False
 
-        self._initialized = True
+        with self._lock:
+            if self._subprocess is not proc or self._failure is not None or self._stopping:
+                return False
+            self._initialized = True
         return True
 
-    def start_reader(self, on_data, on_event):
+    def start_reader(self, on_data, on_event, proc=None):
         """Start the event reader thread.
 
         Args:
@@ -3108,73 +3240,68 @@ class _BleHeadlessManager:
             on_event: callback(event_dict) for runtime events (connected, disconnected, etc.)
         """
         self._reader_thread = threading.Thread(
-            target=self._event_reader, args=(on_data, on_event), daemon=True)
+            target=self._event_reader, args=(on_data, on_event, proc or self._subprocess), daemon=True)
         self._reader_thread.start()
 
-    def _event_reader(self, on_data, on_event):
-        """Read events from the BLE subprocess stdout (runs in a thread).
+    def accepts_event(self, event):
+        """Revalidate queued events when the headless main loop consumes them."""
+        with self._lock:
+            return (event.get('_owner') is self._subprocess and self._subprocess is not None
+                    and not self._stopping
+                    and (self._failure is None or event['e'] == 'service_lost'))
 
-        Handles two formats on the binary stdout stream:
-        - Binary data packets: 0xFF + slot(1) + payload(64) = 66 bytes
-        - JSON text lines: UTF-8 encoded, terminated by newline
-        """
-        try:
-            stdout = self._subprocess.stdout
-            while True:
-                header = stdout.read(1)
-                if not header:
-                    break
-                if header[0] == 0xFF:
-                    packet = stdout.read(65)
-                    if len(packet) < 65:
-                        break
-                    si = packet[0]
-                    on_data(si, packet[1:65])
-                    continue
+    def _event_reader(self, on_data, on_event, proc=None):
+        proc = proc or self._subprocess
 
-                rest = stdout.readline()
-                line = (header + rest).decode('utf-8', errors='replace').strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+        def data(si, payload):
+            with self._lock:
+                if self._subprocess is proc and not self._stopping and self._failure is None:
+                    on_data(si, payload)
 
-                etype = event.get('e')
-
-                if not self._initialized and etype in (
-                        'ready', 'bluez_stopped', 'open_ok', 'error'):
-                    self._init_result = event
+        def event(ev):
+            with self._lock:
+                if self._subprocess is not proc or self._stopping or self._failure is not None:
+                    return
+                if not self._initialized and ev['e'] in ('ready', 'bluez_stopped', 'open_ok', 'error'):
+                    self._init_result = ev
                     self._init_event.set()
-                    continue
+                else:
+                    on_event(dict(ev, _owner=proc))
 
-                on_event(event)
-        except Exception:
-            pass
+        try:
+            read_events(proc.stdout, data, event)
+        except Exception as exc:
+            with self._lock:
+                if self._subprocess is proc and not self._stopping and self._failure is None:
+                    self._initialized = False
+                    self._failure = {'e': 'service_lost', '_owner': proc,
+                                     'msg': 'BLE input queue full' if isinstance(exc, queue.Full) else str(exc)}
+                    self._init_event.set()
+                    # The main loop also polls _failure, so a broken event
+                    # callback cannot hide loss of the transport.
+        finally:
+            proc.stdout.close()
 
-    def shutdown(self):
-        """Send shutdown, terminate process."""
-        if self._subprocess:
-            try:
-                self.send_cmd({"cmd": "shutdown"})
-                self._subprocess.wait(timeout=5.0)
-            except Exception:
-                pass
-            try:
-                self._subprocess.stdin.close()
-            except Exception:
-                pass
-            try:
-                self._subprocess.terminate()
-                self._subprocess.wait(timeout=3)
-            except Exception:
+    def shutdown(self, proc=None):
+        """Mark intentional shutdown before its EOF can look like a failure."""
+        with self._lock:
+            if proc is not None and self._subprocess is not proc:
+                return
+            self._stopping = True
+            proc = self._subprocess
+            self._initialized = False
+            self._init_event.set()
+        if proc is not None:
+            if self._failure is None:
                 try:
-                    self._subprocess.kill()
+                    self.send_cmd({"cmd": "shutdown"}, proc=proc)
+                    proc.wait(timeout=5)
                 except Exception:
                     pass
-            self._subprocess = None
-        self._initialized = False
+            with self._lock:
+                if self._subprocess is proc:
+                    self._subprocess = None
+            reap_helper(proc)
 
     @property
     def is_alive(self) -> bool:
@@ -3408,10 +3535,7 @@ def run_headless(mode_override: str = None):
         """Low-latency callback from the reader thread for BLE data."""
         q = ble_data_queues.get(slot_index)
         if q is not None:
-            try:
-                q.put_nowait(data_bytes)
-            except _queue.Full:
-                pass
+            q.put_nowait(data_bytes)  # Overflow retires the helper; never drop a release.
 
     def _on_ble_event(event):
         """Runtime event callback from the reader thread."""
@@ -3458,8 +3582,29 @@ def run_headless(mode_override: str = None):
         """Process a BLE runtime event in the main loop."""
         nonlocal ble_scanning_slot
 
+        if not ble_mgr or not ble_mgr.accepts_event(event):
+            return
         etype = event.get('e')
         si = event.get('s')
+        if etype == 'service_lost':
+            ble_scanning_slot = None
+            ble_pending_reconnects.clear()
+            for slot_info in list(active_slots):
+                if slot_info['type'] != 'ble' or slot_info.get('ble_process') is not event['_owner']:
+                    continue
+                idx = slot_info['index']
+                active_slots.remove(slot_info)
+                ble_data_queues.pop(idx, None)
+                rumble_states[idx] = False
+                slot_info['input_proc'].stop_event.set()
+                for cleanup in (slot_info['emu_mgr'].stop, slot_info['input_proc'].stop):
+                    try:
+                        cleanup()
+                    except Exception:
+                        logger.exception("Headless BLE slot cleanup failed")
+            ble_mgr.shutdown()
+            print(f"BLE service stopped: {event['msg']}. Restart to retry; USB remains active.")
+            return
 
         if etype == 'status' and si is not None:
             print(f"[slot {si + 1}] BLE: {event.get('msg', '')}")
@@ -3536,6 +3681,7 @@ def run_headless(mode_override: str = None):
                 'device_path': None,
                 'disc_event': disc_event,
                 'ble_address': mac,
+                'ble_process': event['_owner'],
             })
 
             ble_scanning_slot = None
@@ -3554,16 +3700,16 @@ def run_headless(mode_override: str = None):
                 # Targeted reconnect failed — retry after 3 seconds
                 mac = ble_pending_reconnects[si]
                 if not stop_event.is_set():
-                    threading.Timer(3.0, lambda _si=si, _mac=mac:
+                    threading.Timer(3.0, lambda _si=si, _mac=mac, owner=event['_owner']:
                         ble_event_queue.put(
-                            {'e': '_retry_reconnect', 's': _si, 'mac': _mac}
+                            {'e': '_retry_reconnect', 's': _si, 'mac': _mac, '_owner': owner}
                         )).start()
             else:
                 # General scan failed — retry after 3 seconds
                 ble_scanning_slot = None
                 if not stop_event.is_set():
-                    threading.Timer(3.0, lambda: ble_event_queue.put(
-                        {'e': '_retry_scan'})).start()
+                    threading.Timer(3.0, lambda owner=event['_owner']: ble_event_queue.put(
+                        {'e': '_retry_scan', '_owner': owner})).start()
 
         elif etype == 'disconnected' and si is not None:
             # Find the active slot info
@@ -3651,6 +3797,9 @@ def run_headless(mode_override: str = None):
         if stop_event.is_set():
             break
 
+        # Loss has priority over already queued connected/retry events.
+        if ble_mgr and ble_mgr._failure is not None:
+            _handle_headless_ble_event(ble_mgr._failure)
         # Process BLE events
         while True:
             try:
@@ -3748,6 +3897,8 @@ def run_headless(mode_override: str = None):
                         break
 
                 # Also drain BLE events while waiting for USB reconnect
+                if ble_mgr and ble_mgr._failure is not None:
+                    _handle_headless_ble_event(ble_mgr._failure)
                 while True:
                     try:
                         ev = ble_event_queue.get_nowait()

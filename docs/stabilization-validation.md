@@ -86,3 +86,20 @@ separate high-priority changes requiring full integration review and tests.
 
 There is no native CoreHID backend, iOS/tvOS port, new signing identity, or
 notarization automation in this batch.
+
+## BLE helper-loss follow-up
+
+Unexpected helper EOF, malformed/truncated framing, or a full input/event queue
+now retires that helper's BLE outputs instead of silently exiting or dropping a
+release. GUI delivery uses the existing owner-thread UI poll; old-process events
+and initialization completions are discarded. USB slots remain active. Retry is
+explicit: Pair again in the GUI, or restart headless mode. Output teardown resets
+and flushes neutral state before close, serialized against in-flight updates.
+
+The wire format is unchanged (66-byte reports plus JSON lines). JSON lines are
+limited to 64 KiB; the GUI holds at most 256 pending helper events and handles up
+to 32 per UI tick. Hardware tests still need to kill the helper while holding a
+button and confirm neutral output, unaffected USB input, and successful retry.
+Synchronous command writes, backend cancellation, pending gamepad creation,
+buffered same-process slot reuse, and Linux service restoration remain separate
+work. This follow-up does not restore the archived runtime or IPC-v2 rewrite.

@@ -24,6 +24,7 @@ class EmulationManager:
 
     def __init__(self, cal_mgr: CalibrationManager):
         self._cal_mgr = cal_mgr
+        self._output_lock = threading.RLock()
         self.gamepad: Optional[VirtualGamepad] = None
         self.is_emulating = False
         self.mode: str = 'xbox360'
@@ -45,21 +46,27 @@ class EmulationManager:
     def stop(self) -> None:
         """Stop emulation and destroy the virtual gamepad."""
         logger.info("Stopping emulation (mode=%s)", self.mode)
-        self.is_emulating = False
-        self._prev_buttons = {}
-        if self.gamepad:
-            try:
-                self.gamepad.stop_rumble_listener()
-            except Exception:
-                pass
-            try:
-                self.gamepad.close()
-            except Exception:
-                pass
-            self.gamepad = None
+        with self._output_lock:
+            self.is_emulating = False
+            gamepad, self.gamepad = self.gamepad, None
+            self._prev_buttons = {}
+            if gamepad is not None:
+                for action in (gamepad.stop_rumble_listener, gamepad.reset,
+                               gamepad.update, gamepad.close):
+                    try:
+                        action()
+                    except Exception:
+                        logger.debug("Virtual output teardown failed", exc_info=True)
 
     def update(self, left_x, left_y, right_x, right_y,
                left_trigger, right_trigger, button_states: Dict[str, bool]):
+        """Serialize forwarding with neutralization and disposal."""
+        with self._output_lock:
+            self._update(left_x, left_y, right_x, right_y,
+                         left_trigger, right_trigger, button_states)
+
+    def _update(self, left_x, left_y, right_x, right_y,
+                left_trigger, right_trigger, button_states):
         """Update virtual Xbox 360 controller state (hot path)."""
         if not self.gamepad:
             return
