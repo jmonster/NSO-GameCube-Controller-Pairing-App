@@ -38,29 +38,19 @@ Protocol:
 import asyncio
 import base64
 import json
+import logging
 import os
 import queue
 import sys
 import threading
 
 
-_stdout_fd = None
-
-
-def _get_stdout_fd():
-    global _stdout_fd
-    if _stdout_fd is None:
-        _stdout_fd = sys.stdout.buffer.fileno()
-    return _stdout_fd
+_output = None
 
 
 def send(event: dict):
-    """Send a JSON-line event to the parent process via stdout fd."""
-    try:
-        os.write(_get_stdout_fd(),
-                 (json.dumps(event, separators=(',', ':')) + '\n').encode('utf-8'))
-    except Exception:
-        pass
+    """Queue a JSON event on the same ordered stream as input reports."""
+    _output.submit((json.dumps(event, separators=(',', ':')) + '\n').encode('utf-8'))
 
 
 class PipeQueue:
@@ -68,7 +58,7 @@ class PipeQueue:
 
     Uses a compact binary format (0xFF + slot + 64 bytes) instead of
     JSON+base64 to minimize serialization overhead on the hot path.
-    Writes via os.write() for single-syscall low-latency delivery.
+    Queues immutable snapshots without blocking Bluetooth callbacks.
     """
 
     def __init__(self, slot_index: int):
@@ -84,9 +74,9 @@ class PipeQueue:
             pkt[2:2 + len(src)] = src
             if len(src) < 64:
                 pkt[2 + len(src):66] = b'\x00' * (64 - len(src))
-            os.write(_get_stdout_fd(), pkt)
-        except Exception:
-            pass
+            _output.submit(pkt)
+        except Exception as exc:
+            _output.fail(exc)
 
     def put(self, data):
         self.put_nowait(data)
@@ -220,6 +210,10 @@ def main():
             if p and p not in sys.path:
                 sys.path.insert(0, p)
 
+    from gc_controller.ble.pipe_output import PipeWriter
+    global _output
+    _output = PipeWriter(sys.stdout.buffer.fileno())
+
     if sys.platform == "win32":
         try:
             from bleak.backends.winrt.util import uninitialize_sta
@@ -231,6 +225,7 @@ def main():
         from gc_controller.ble.bleak_backend import BleakBackend
     except ImportError as e:
         send({"e": "error", "ctx": "import", "msg": str(e)})
+        _output.close()
         sys.exit(1)
 
     backend = BleakBackend()
@@ -347,18 +342,48 @@ def main():
                 for task in connect_tasks.values():
                     if not task.done():
                         task.cancel()
-                try:
-                    await backend.close()
-                except Exception:
-                    pass
-                break
+                break  # Shared exit cleanup below also handles EOF/output failure.
 
+    task = loop.create_task(process())
+
+    def output_failed(error):
+        # Wake the executor's queue.get as well as the command coroutine. Never
+        # try to report a broken stdout by enqueueing another stdout message.
+        cmd_queue.put(None)
+        try:
+            loop.call_soon_threadsafe(task.cancel)
+        except RuntimeError:
+            pass  # The loop has already completed shutdown.
+
+    _output.on_failure = output_failed
+    if _output.error is not None:
+        output_failed(_output.error)
     try:
-        loop.run_until_complete(process())
-    except KeyboardInterrupt:
+        loop.run_until_complete(task)
+    except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
+        _output.on_failure = None
+        cmd_queue.put(None)
+        pending = asyncio.all_tasks(loop)
+        for pending_task in pending:
+            pending_task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.wait(pending, timeout=0.5))
+        close_task = loop.create_task(backend.close())
+        done, _ = loop.run_until_complete(asyncio.wait({close_task}, timeout=2))
+        if close_task in done:
+            try:
+                close_task.result()
+            except Exception:
+                logging.getLogger(__name__).warning('BLE backend cleanup failed', exc_info=True)
+        else:
+            close_task.cancel()
+            logging.getLogger(__name__).warning('BLE backend cleanup timed out')
+        _output.close()
         loop.close()
+    if _output.error is not None:
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':
