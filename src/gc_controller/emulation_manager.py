@@ -28,39 +28,59 @@ class EmulationManager:
         self.is_emulating = False
         self.mode: str = 'xbox360'
         self._prev_buttons: Dict[str, bool] = {}
+        self._output_lock = threading.Lock()
+        self._generation = 0
 
     def start(self, mode: str = 'xbox360', slot_index: int = 0,
               cancel_event: threading.Event | None = None,
               rumble_callback=None) -> None:
         """Create the virtual gamepad and begin emulation. Raises on failure."""
-        self.mode = mode
-        self._prev_buttons = {}
+        with self._output_lock:
+            self._generation += 1
+            generation = self._generation
         logger.info("Starting emulation: mode=%s slot=%d", mode, slot_index)
-        self.gamepad = create_gamepad(mode, slot_index=slot_index,
-                                     cancel_event=cancel_event)
-        if rumble_callback and mode in ('xbox360', 'dsu'):
-            self.gamepad.set_rumble_callback(rumble_callback)
-        self.is_emulating = True
+        pad = create_gamepad(mode, slot_index=slot_index, cancel_event=cancel_event)
+        try:
+            if rumble_callback and mode in ('xbox360', 'dsu'):
+                pad.set_rumble_callback(rumble_callback)
+            with self._output_lock:
+                if generation != self._generation or cancel_event and cancel_event.is_set():
+                    raise OSError(errno.ECANCELED, 'Output creation was retired')
+                self.mode = mode
+                self._prev_buttons = {}
+                self.gamepad = pad
+                self.is_emulating = True
+        except Exception:
+            self._close_gamepad(pad)
+            raise
+
+    @staticmethod
+    def _close_gamepad(pad):
+        for operation in (pad.reset, pad.update, pad.stop_rumble_listener, pad.close):
+            try:
+                operation()
+            except Exception:
+                logger.warning('Output teardown operation failed', exc_info=True)
 
     def stop(self) -> None:
-        """Stop emulation and destroy the virtual gamepad."""
-        logger.info("Stopping emulation (mode=%s)", self.mode)
-        self.is_emulating = False
-        self._prev_buttons = {}
-        if self.gamepad:
-            try:
-                self.gamepad.stop_rumble_listener()
-            except Exception:
-                pass
-            try:
-                self.gamepad.close()
-            except Exception:
-                pass
-            self.gamepad = None
+        """Serialize with input, detach, and attempt every neutralization step."""
+        with self._output_lock:
+            self._generation += 1
+            self.is_emulating = False
+            self._prev_buttons = {}
+            pad, self.gamepad = self.gamepad, None
+            if pad is not None:
+                self._close_gamepad(pad)
 
     def update(self, left_x, left_y, right_x, right_y,
                left_trigger, right_trigger, button_states: Dict[str, bool]):
         """Update virtual Xbox 360 controller state (hot path)."""
+        with self._output_lock:
+            self._update(left_x, left_y, right_x, right_y,
+                         left_trigger, right_trigger, button_states)
+
+    def _update(self, left_x, left_y, right_x, right_y,
+                left_trigger, right_trigger, button_states):
         if not self.gamepad:
             return
 

@@ -18,6 +18,7 @@ import errno
 import json
 import logging
 import os
+import queue
 import shutil
 import signal
 import subprocess
@@ -114,6 +115,7 @@ from .emulation_manager import EmulationManager
 from .input_processor import InputProcessor
 from .controller_slot import ControllerSlot, normalize_ble_address
 from .ble.sw2_protocol import build_rumble_packet
+from .ble.ipc import HelperSession, close_helper, read_event_stream, retire_input
 
 # System tray support (optional).
 # On macOS, pystray runs [NSApplication run] from a background thread which
@@ -228,8 +230,9 @@ class GCControllerEnabler:
         self._ble_reader_thread = None
         self._ble_stderr_thread = None
         self._ble_initialized = False
-        self._ble_init_event = threading.Event()
-        self._ble_init_result = None
+        self._ble_session = None
+        self._ble_events = queue.SimpleQueue()
+        self._ble_closing = False
         self._ble_pair_mode = {}  # slot_index -> 'pair' | 'reconnect' | 'autoscan'
         self._ble_slot_remap = {}  # subprocess_slot -> actual UI slot (when reassigned)
         self._diff_scan_callback = {}  # slot_index -> completion callback
@@ -252,8 +255,6 @@ class GCControllerEnabler:
         # Track recent USB hotplug connections for cross-transport migration.
         # Maps slot_index -> (timestamp, usb_device_identity)
         self._recent_usb_hotplug: dict[int, tuple[float, str]] = {}
-
-        self._ble_init_retry_count = 0
 
         # UI — pass list of cal_mgrs for live octagon drawing
         self.ui = ControllerUI(
@@ -606,7 +607,7 @@ class GCControllerEnabler:
                     os.path.dirname(__file__), 'ble', 'bleak_subprocess.py')
                 python_path = os.pathsep.join(p for p in sys.path if p)
                 cmd = [sys.executable, script_path, python_path]
-            self._ble_subprocess = subprocess.Popen(
+            proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -620,111 +621,170 @@ class GCControllerEnabler:
                     os.path.dirname(__file__), 'ble', 'ble_subprocess.py')
                 python_path = os.pathsep.join(p for p in sys.path if p)
                 cmd = ['pkexec', sys.executable, script_path, python_path]
-            self._ble_subprocess = subprocess.Popen(
+            proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
 
+        self._ble_session = session = HelperSession(proc)
+        self._ble_subprocess = proc
+        if self._ble_closing:
+            self._cleanup_ble(session)
+            return session
         self._ble_reader_thread = threading.Thread(
-            target=self._ble_event_reader, daemon=True)
+            target=self._ble_event_reader, args=(session,), daemon=True)
         self._ble_reader_thread.start()
         self._ble_stderr_thread = threading.Thread(
-            target=self._ble_stderr_reader, daemon=True)
+            target=self._ble_stderr_reader, args=(session.process,), daemon=True)
         self._ble_stderr_thread.start()
+        return session
 
-    def _send_ble_cmd(self, cmd: dict):
-        """Send a JSON-line command to the BLE subprocess."""
-        if self._ble_subprocess and self._ble_subprocess.poll() is None:
+    def _send_ble_cmd(self, cmd: dict, session=None):
+        """Send only to the captured helper; parent write backpressure is separate."""
+        session = session or self._ble_session
+        if session is not self._ble_session or session is None or session.ended:
+            return
+        proc = session.process
+        if proc.poll() is None:
             try:
                 line = json.dumps(cmd, separators=(',', ':')) + '\n'
-                self._ble_subprocess.stdin.write(line.encode('utf-8'))
-                self._ble_subprocess.stdin.flush()
+                proc.stdin.write(line.encode('utf-8'))
+                proc.stdin.flush()
             except Exception:
                 pass
 
-    def _wait_ble_init(self, timeout: float) -> dict | None:
-        """Block until the next init event from the BLE subprocess."""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self._ble_subprocess and self._ble_subprocess.poll() is not None:
-                return None
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None
-            if self._ble_init_event.wait(timeout=min(remaining, 0.5)):
-                result = self._ble_init_result
-                self._ble_init_event.clear()
-                return result
-        return None
+    def _wait_ble_init(self, timeout: float, session=None) -> dict | None:
+        session = session or self._ble_session
+        return session.wait_init(timeout) if session else None
 
-    def _cleanup_ble(self):
-        """Clean up BLE subprocess."""
-        if self._ble_subprocess:
-            try:
-                self._ble_subprocess.stdin.close()
-            except Exception:
-                pass
-            try:
-                self._ble_subprocess.terminate()
-                self._ble_subprocess.wait(timeout=3)
-            except Exception:
-                try:
-                    self._ble_subprocess.kill()
-                except Exception:
-                    pass
+    def _cleanup_ble(self, session=None):
+        """Retire only the owning helper, before closing its pipes."""
+        session = session or self._ble_session
+        if session is None:
+            return
+        session.end()
+        if self._ble_session is session:
             self._ble_subprocess = None
-        self._ble_initialized = False
-        self._ble_slot_remap.clear()
+            self._ble_initialized = False
+            self._ble_slot_remap.clear()
+        close_helper(session)
 
-    def _ble_event_reader(self):
-        """Read events from the BLE subprocess stdout (runs in a thread).
+    def _ble_event_reader(self, session=None):
+        """Fail closed on EOF, malformed IPC or overflow; never drop transitions."""
+        session = session or self._ble_session
+        reason = 'BLE helper closed its output'
 
-        Handles two formats on the binary stdout stream:
-        - Binary data packets: 0xFF + slot(1) + payload(64) = 66 bytes
-        - JSON text lines: UTF-8 encoded, terminated by newline
-        """
+        def on_data(si, data):
+            with session.condition:
+                if self._ble_session is not session or session.ended:
+                    return
+                si = self._ble_slot_remap.get(si, si)
+                slot = self.slots[si]
+                # Also retain reports while a connected event is being applied.
+                # The UI may have popped its pending mode but not attached output.
+                if (slot.ble_session in (None, session)
+                        and not (slot.is_connected and slot.connection_mode == 'usb')):
+                    try:
+                        slot.ble_data_queue.put_nowait(data)
+                    except queue.Full as exc:
+                        raise BufferError('BLE input queue exhausted') from exc
+
+        def on_event(event):
+            if self._ble_session is not session or session.ended:
+                return
+            if not session.initialized and event['e'] in (
+                    'ready', 'bluez_stopped', 'open_ok', 'error'):
+                session.init_event(event)
+            else:
+                self._ble_events.put((session, event))
+
         try:
-            stdout = self._ble_subprocess.stdout
-            while True:
-                header = stdout.read(1)
-                if not header:
-                    break
-                if header[0] == 0xFF:
-                    packet = stdout.read(65)
-                    if len(packet) < 65:
-                        break
-                    si = self._ble_slot_remap.get(packet[0], packet[0])
-                    if 0 <= si < len(self.slots):
-                        self.slots[si].ble_data_queue.put(packet[1:65])
-                    continue
+            read_event_stream(session.process.stdout, on_data, on_event)
+        except Exception as exc:
+            reason = f'BLE input failed: {type(exc).__name__}: {exc}'
+        finally:
+            if session.end(reason):
+                self._ble_events.put((session, {'e': '_service_lost'}))
 
-                rest = stdout.readline()
-                line = (header + rest).decode('utf-8', errors='replace').strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+    def _owned_ble_callback(self, callback):
+        session = self._ble_session
 
-                etype = event.get('e')
+        def run(*args):
+            if session is not None and self._ble_session is session and not session.ended:
+                return callback(*args)
+        return run
 
-                if not self._ble_initialized and etype in (
-                        'ready', 'bluez_stopped', 'open_ok', 'error'):
-                    self._ble_init_result = event
-                    self._ble_init_event.set()
-                    continue
+    def _dispatch_ble_event(self, session, event):
+        """Ownership is checked on the UI thread, not just when enqueuing."""
+        if event['e'] == '_init_complete':
+            self._on_ble_init_complete(event['success'], event['attempt'], session)
+        elif event['e'] == '_service_lost':
+            self._ble_service_lost(session)
+        elif self._ble_session is session and not session.ended:
+            self._handle_ble_event(event)
 
-                self.root.after(
-                    0, lambda ev=event: self._handle_ble_event(ev))
-        except Exception:
-            pass
+    def _ble_service_lost(self, session):
+        if not session.claim_loss():
+            return
+        logger.warning('%s', session.failure)
+        if self._ble_session is session:
+            self._ble_initialized = False
+            self._ble_init_in_progress = False
+            try:
+                self._stop_auto_scan()
+            except Exception:
+                logger.warning('BLE scan UI cleanup failed', exc_info=True)
+            self._auto_scan_pending = False
+            self._auto_scan_slot = None
+            pending = list(self._ble_pair_mode)
+            self._ble_pair_mode.clear()
+            for si in pending:
+                if not self.slots[si].is_connected:
+                    try:
+                        self.ui.update_ble_status(si, session.failure)
+                        self.ui.slots[si].pair_btn.configure(state='normal')
+                    except Exception:
+                        logger.warning('BLE pairing UI cleanup failed', exc_info=True)
+            self._diff_scan_callback.clear()
+            self._scan_stream_callback.clear()
+            self._ble_known_scan_slot = None
+        for si, slot in enumerate(self.slots):
+            if slot.ble_session is not session or slot.connection_mode != 'ble':
+                continue
+            slot.ble_session = None
+            slot.ble_connected = False
+            slot.ble_address = None
+            slot.device_identity = None
+            slot.rumble_desired = 0.0
+            slot.rumble_state = False
+            cancel = getattr(slot, '_pipe_cancel', None)
+            if cancel:
+                cancel.set()
+            retire_input(slot.input_proc, slot.emu_mgr)
+            self._latest_ui_data[si] = None
+            try:
+                while True:
+                    slot.ble_data_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._stop_rumble_pwm(si)
+                self.ui.reset_slot_ui(si)
+                self.ui.update_tab_status(si, connected=False, emulating=False)
+                self.ui.update_ble_status(si, session.failure)
+                self.ui.slots[si].connect_btn.configure(state='normal')
+                if self.ui.slots[si].pair_btn:
+                    self.ui.slots[si].pair_btn.configure(
+                        text=t('ui.pair_wireless'), state='normal')
+            except Exception:
+                logger.warning('BLE loss UI update failed', exc_info=True)
+        self._cleanup_ble(session)
+        # Retry only on explicit user action, never a privilege-prompt loop.
 
-    def _ble_stderr_reader(self):
+    def _ble_stderr_reader(self, proc):
         """Forward BLE subprocess stderr into the app logger."""
-        proc = self._ble_subprocess
         if not proc or not proc.stderr:
             return
         try:
@@ -778,8 +838,8 @@ class GCControllerEnabler:
             elif mode in ('pair', 'wizard'):
                 self._on_pair_complete(si, None, error=msg)
             else:
-                self.root.after(
-                    3000, lambda _si=si: self._attempt_ble_reconnect(_si))
+                session = self._ble_session
+                self.root.after(3000, lambda: self._retry_ble_reconnect(session, si))
 
         elif etype == 'devices_found' and si is not None:
             self._on_devices_found(si, event.get('devices', []))
@@ -809,6 +869,10 @@ class GCControllerEnabler:
         using Bleak/CoreBluetooth (no elevated privileges needed).
         Returns True on success.
         """
+        if self._ble_closing:
+            return False
+        if self._ble_session and self._ble_session.failure:
+            self._ble_service_lost(self._ble_session)
         if self._ble_initialized:
             return True
 
@@ -826,38 +890,41 @@ class GCControllerEnabler:
             return False
 
         try:
-            self._start_ble_subprocess()
+            session = self._start_ble_subprocess()
         except Exception as e:
             self._messagebox.showerror(
                 t("error.ble"), t("error.ble_start_failed", error=e))
             return False
 
         # Wait for subprocess to start (user authenticates via pkexec on Linux)
-        result = self._wait_ble_init(timeout=60)
+        result = self._wait_ble_init(timeout=60, session=session)
         if not result or result.get('e') != 'ready':
-            self._cleanup_ble()
+            self._cleanup_ble(session)
             self._messagebox.showerror(
                 t("error.ble"), t("error.ble_auth_cancelled"))
             return False
 
         # Stop BlueZ (must release HCI adapter for Bumble)
-        self._send_ble_cmd({"cmd": "stop_bluez"})
-        result = self._wait_ble_init(timeout=15)
+        self._send_ble_cmd({"cmd": "stop_bluez"}, session)
+        result = self._wait_ble_init(timeout=15, session=session)
         if not result or result.get('e') != 'bluez_stopped':
-            self._cleanup_ble()
+            self._cleanup_ble(session)
             return False
 
         # Open HCI adapter
-        self._send_ble_cmd({"cmd": "open"})
-        result = self._wait_ble_init(timeout=15)
+        self._send_ble_cmd({"cmd": "open"}, session)
+        result = self._wait_ble_init(timeout=15, session=session)
         if not result or result.get('e') == 'error':
             msg = result.get('msg', 'Unknown error') if result else 'Timeout'
-            self._cleanup_ble()
+            self._cleanup_ble(session)
             self._messagebox.showerror(
                 t("error.ble"), t("error.ble_adapter", msg=msg))
             return False
 
-        self._ble_initialized = True
+        with session.condition:
+            if self._ble_session is not session or session.ended:
+                return False
+            session.initialized = self._ble_initialized = True
         return True
 
     def _init_ble_async(self):
@@ -866,70 +933,61 @@ class GCControllerEnabler:
         On completion, posts _on_ble_init_complete() to the main thread.
         On Linux this triggers pkexec for elevated privileges.
         """
+        if self._ble_closing:
+            return
+        if self._ble_session and self._ble_session.failure:
+            self._ble_service_lost(self._ble_session)
         if self._ble_initialized or self._ble_init_in_progress:
             if self._ble_initialized:
                 self._start_auto_scan()
             return
 
         self._ble_init_in_progress = True
+        attempt = self._ble_init_attempt = object()
 
         def _bg_init():
-            try:
-                success = self._init_ble_background()
-                self.root.after(0, lambda: self._on_ble_init_complete(success))
-            except Exception:
-                self.root.after(0, lambda: self._on_ble_init_complete(False))
+            session, success = self._init_ble_background()
+            self._ble_events.put((session, {'e': '_init_complete',
+                                           'attempt': attempt, 'success': success}))
 
         threading.Thread(target=_bg_init, daemon=True).start()
 
-    def _init_ble_background(self) -> bool:
-        """Run the full BLE init sequence (blocking). Called from background thread.
-
-        Same as _init_ble() but without messagebox error dialogs (silent for auto-init).
-        """
-        if sys.platform == 'linux' and not shutil.which('pkexec'):
-            return False
-
+    def _init_ble_background(self):
+        """Run initialization for one helper; return its identity with the result."""
+        session = None
         try:
-            self._start_ble_subprocess()
+            if sys.platform == 'linux' and not shutil.which('pkexec'):
+                return session, False
+            session = self._start_ble_subprocess()
+            for command, expected, timeout in (
+                    (None, 'ready', 60), ('stop_bluez', 'bluez_stopped', 15),
+                    ('open', 'open_ok', 15)):
+                if command:
+                    self._send_ble_cmd({'cmd': command}, session)
+                result = self._wait_ble_init(timeout, session)
+                if not result or result.get('e') != expected:
+                    self._cleanup_ble(session)
+                    return session, False
+            with session.condition:
+                if self._ble_session is not session or session.ended:
+                    return session, False
+                session.initialized = self._ble_initialized = True
+            return session, True
         except Exception:
-            return False
+            if session:
+                self._cleanup_ble(session)
+            logger.warning('BLE initialization failed', exc_info=True)
+            return session, False
 
-        # Wait for subprocess to start
-        result = self._wait_ble_init(timeout=60)
-        if not result or result.get('e') != 'ready':
-            self._cleanup_ble()
-            return False
-
-        # Stop BlueZ (Linux only — must release HCI adapter for Bumble)
-        self._send_ble_cmd({"cmd": "stop_bluez"})
-        result = self._wait_ble_init(timeout=15)
-        if not result or result.get('e') != 'bluez_stopped':
-            self._cleanup_ble()
-            return False
-
-        # Open HCI adapter
-        self._send_ble_cmd({"cmd": "open"})
-        result = self._wait_ble_init(timeout=15)
-        if not result or result.get('e') == 'error':
-            self._cleanup_ble()
-            return False
-
-        self._ble_initialized = True
-        return True
-
-    def _on_ble_init_complete(self, success: bool):
-        """Handle completion of async BLE init on the main thread."""
+    def _on_ble_init_complete(self, success: bool, attempt, session):
+        """A retired init attempt must not start scanning a replacement helper."""
+        if (self._ble_closing or self._ble_init_attempt is not attempt
+                or session is not None and self._ble_session is not session):
+            return
         self._ble_init_in_progress = False
-
-        if success:
-            self._ble_init_retry_count = 0
+        if success and session is not None and not session.ended:
             self._start_auto_scan()
-        else:
-            self._ble_init_retry_count += 1
-            if self._ble_init_retry_count < 3 and self.slot_calibrations[0].get('auto_scan_ble', True):
-                # Retry after 30s
-                self.root.after(30000, self._init_ble_async)
+        # Failed initialization is user-retried; no repeated privilege prompts.
 
     def pair_controller(self, slot_index: int):
         """Start BLE pairing to discover a NEW controller.
@@ -1052,8 +1110,11 @@ class GCControllerEnabler:
                 sui.pair_btn.configure(state='normal')
             return
 
+        session = self._ble_session
         picker = BLEDevicePickerDialog(self.root, devices)
         chosen_address = picker.show()
+        if self._ble_session is not session or session.ended:
+            return
 
         if not chosen_address:
             # User cancelled
@@ -1135,6 +1196,7 @@ class GCControllerEnabler:
             slot.conn_mgr.device_path = None
             slot.device_path = None
 
+            slot.ble_session = self._ble_session
             slot.ble_connected = True
             slot.ble_address = mac
             slot.connection_mode = 'ble'
@@ -1154,7 +1216,7 @@ class GCControllerEnabler:
             self.ui.update_ble_status(slot_index, t("ble.connected", mac=mac))
             if self._needs_calibration(slot_index):
                 self.ui.update_status(slot_index, t("ui.new_controller_cal"))
-                self.root.after(500, lambda si=slot_index: self._start_auto_calibration(si))
+                self.root.after(500, self._owned_ble_callback(lambda si=slot_index: self._start_auto_calibration(si)))
             else:
                 self.ui.update_status(slot_index, t("ui.connected_ble"))
             self.ui.update_tab_status(
@@ -1230,7 +1292,7 @@ class GCControllerEnabler:
             # Disconnect if this device is currently connected on any slot
             for slot in self.slots:
                 if slot.ble_address and slot.ble_address.upper() == addr_upper:
-                    self.root.after(0, lambda s=slot: self.disconnect_controller(s.index))
+                    self.root.after(0, self._owned_ble_callback(lambda s=slot: self.disconnect_controller(s.index)))
             # Stop auto-scan if no known devices remain
             if not devices:
                 self._stop_auto_scan()
@@ -1275,17 +1337,20 @@ class GCControllerEnabler:
         """Launch the live-scan controller discovery dialog."""
         from .ui_ble_scan_wizard import BLEControllerScanDialog
 
+        session = self._ble_session
         self._ble_pair_mode[slot_index] = 'wizard'
 
         def on_start_scan():
             self._send_ble_cmd({
                 "cmd": "scan_start",
                 "slot_index": slot_index,
-            })
+            }, session)
 
         def on_stop_scan():
+            if self._ble_session is not session or session.ended:
+                return
             self._scan_stream_callback.pop(slot_index, None)
-            self._send_ble_cmd({"cmd": "scan_stop"})
+            self._send_ble_cmd({"cmd": "scan_stop"}, session)
 
         dialog = BLEControllerScanDialog(
             self.root,
@@ -1296,6 +1361,8 @@ class GCControllerEnabler:
         self._scan_stream_callback[slot_index] = dialog.add_device
 
         chosen_address = dialog.show()
+        if self._ble_session is not session or session.ended:
+            return
 
         self._scan_stream_callback.pop(slot_index, None)
 
@@ -1369,12 +1436,12 @@ class GCControllerEnabler:
             if self._auto_scan_timer_id is not None:
                 self.root.after_cancel(self._auto_scan_timer_id)
             self._auto_scan_timer_id = self.root.after(
-                delay_ms, self._auto_scan_tick)
+                delay_ms, self._owned_ble_callback(self._auto_scan_tick))
         else:
             self._auto_scan_active = True
             self.ui.set_ble_scanning(True)
             self._auto_scan_timer_id = self.root.after(
-                delay_ms, self._auto_scan_tick)
+                delay_ms, self._owned_ble_callback(self._auto_scan_tick))
 
     def _auto_scan_tick(self):
         """Periodic callback: scan for any known BLE controller.
@@ -1395,21 +1462,21 @@ class GCControllerEnabler:
         if self._auto_scan_pending:
             logger.debug("Auto-scan tick deferred (pending in-flight)")
             self._auto_scan_timer_id = self.root.after(
-                5000, self._auto_scan_tick)
+                5000, self._owned_ble_callback(self._auto_scan_tick))
             return
 
         # Don't scan while a manual pair or reconnect is active
         active_modes = set(self._ble_pair_mode.values())
         if active_modes - {'autoscan'}:
             self._auto_scan_timer_id = self.root.after(
-                5000, self._auto_scan_tick)
+                5000, self._owned_ble_callback(self._auto_scan_tick))
             return
 
         # Must have known addresses to auto-scan
         known = self._get_known_ble_addresses()
         if not known:
             self._auto_scan_timer_id = self.root.after(
-                10000, self._auto_scan_tick)
+                10000, self._owned_ble_callback(self._auto_scan_tick))
             return
 
         # Build set of already-connected BLE addresses
@@ -1422,14 +1489,14 @@ class GCControllerEnabler:
         unconnected = [a for a in known if a.upper() not in connected_addrs]
         if not unconnected:
             self._auto_scan_timer_id = self.root.after(
-                10000, self._auto_scan_tick)
+                10000, self._owned_ble_callback(self._auto_scan_tick))
             return
 
         # Need a free slot
         slot_idx = self._pick_auto_scan_slot()
         if slot_idx is None:
             self._auto_scan_timer_id = self.root.after(
-                10000, self._auto_scan_tick)
+                10000, self._owned_ble_callback(self._auto_scan_tick))
             return
 
         # Drain stale data from slot queue
@@ -1505,7 +1572,7 @@ class GCControllerEnabler:
                 })
                 if self._auto_scan_active:
                     self._auto_scan_timer_id = self.root.after(
-                        5000, self._auto_scan_tick)
+                        5000, self._owned_ble_callback(self._auto_scan_tick))
                 return
 
         # Resolve the best slot for this device (respects persistent
@@ -1521,7 +1588,7 @@ class GCControllerEnabler:
             })
             if self._auto_scan_active:
                 self._auto_scan_timer_id = self.root.after(
-                    5000, self._auto_scan_tick)
+                    5000, self._owned_ble_callback(self._auto_scan_tick))
             return
 
         subprocess_slot = slot_index
@@ -1563,6 +1630,7 @@ class GCControllerEnabler:
         slot.conn_mgr.device_path = None
         slot.device_path = None
 
+        slot.ble_session = self._ble_session
         slot.ble_connected = True
         slot.ble_address = mac
         slot.connection_mode = 'ble'
@@ -1590,7 +1658,7 @@ class GCControllerEnabler:
         # Look for more controllers soon
         if self._auto_scan_active:
             self._auto_scan_timer_id = self.root.after(
-                3000, self._auto_scan_tick)
+                3000, self._owned_ble_callback(self._auto_scan_tick))
 
     def _on_auto_scan_failed(self, slot_index: int, msg: str):
         """Handle failed auto-scan attempt (silent — controller may be off)."""
@@ -1605,7 +1673,7 @@ class GCControllerEnabler:
         # Schedule next tick
         if self._auto_scan_active:
             self._auto_scan_timer_id = self.root.after(
-                8000, self._auto_scan_tick)
+                8000, self._owned_ble_callback(self._auto_scan_tick))
 
     def _disconnect_ble(self, slot_index: int):
         """Disconnect BLE on a specific slot (user-initiated)."""
@@ -1711,6 +1779,10 @@ class GCControllerEnabler:
         # Ensure auto-scan is running (for reconnecting other known controllers)
         self._ensure_auto_scan()
 
+    def _retry_ble_reconnect(self, session, slot_index):
+        if self._ble_session is session and not session.ended:
+            self._attempt_ble_reconnect(slot_index)
+
     def _attempt_ble_reconnect(self, slot_index: int):
         """Try to reconnect BLE. Retries every 3 seconds."""
         slot = self.slots[slot_index]
@@ -1735,7 +1807,6 @@ class GCControllerEnabler:
             return
 
         if not self._ble_initialized or not self._ble_subprocess:
-            self.root.after(3000, lambda: self._attempt_ble_reconnect(slot_index))
             return
 
         # Drain stale data
@@ -1757,7 +1828,6 @@ class GCControllerEnabler:
     def _on_reconnect_complete(self, slot_index: int, mac: str):
         """Handle successful BLE reconnection."""
         if not mac:
-            self.root.after(3000, lambda: self._attempt_ble_reconnect(slot_index))
             return
 
         # If the slot got claimed by USB while we were reconnecting, find a free one
@@ -1805,8 +1875,10 @@ class GCControllerEnabler:
         slot.conn_mgr.device_path = None
         slot.device_path = None
 
+        slot.ble_session = self._ble_session
         slot.ble_connected = True
         slot.ble_address = mac
+        slot.connection_mode = 'ble'
         slot.device_identity = make_ble_device_identity(mac)
         slot.input_proc.start(mode='ble')
 
@@ -2090,7 +2162,8 @@ class GCControllerEnabler:
 
         self.root.after(
             300,
-            lambda: self._start_rapid_usb_scan(ble_slot, attempts_left - 1))
+            self._owned_ble_callback(
+                lambda: self._start_rapid_usb_scan(ble_slot, attempts_left - 1)))
 
     # ── Cross-transport migration ─────────────────────────────────
 
@@ -2356,8 +2429,12 @@ class GCControllerEnabler:
         Settings rumble-intensity slider are combined into a 0–1 desired
         level, then approximated with a short PWM duty cycle.
         """
-        def _on_rumble(large_motor: int, small_motor: int):
-            slot = self.slots[slot_index]
+        slot = self.slots[slot_index]
+        owner = slot.ble_session if slot.connection_mode == 'ble' else None
+
+        def _apply_rumble(large_motor, small_motor):
+            if owner is not None and (slot.ble_session is not owner or owner.ended):
+                return
             intensity = float(self.slot_calibrations[0].get('rumble_intensity', 1.0))
             host_level = max(large_motor, small_motor) / 255.0
             desired = max(0.0, min(1.0, host_level * intensity))
@@ -2365,8 +2442,11 @@ class GCControllerEnabler:
                     (desired > 0) == (slot.rumble_desired > 0)):
                 return
             slot.rumble_desired = desired
-            # Drive the motor from the Tk main thread
-            self.root.after(0, lambda si=slot_index: self._sync_rumble_output(si))
+            self._sync_rumble_output(slot_index)
+
+        def _on_rumble(large_motor: int, small_motor: int):
+            if owner is None or not owner.ended:
+                self.root.after(0, lambda: _apply_rumble(large_motor, small_motor))
         return _on_rumble
 
     def _set_rumble_hardware(self, slot_index: int, on: bool, force: bool = False):
@@ -2422,6 +2502,7 @@ class GCControllerEnabler:
     def _rumble_cycle(self, slot_index: int):
         """Run one rumble pulse and schedule the next one."""
         slot = self.slots[slot_index]
+        guard = self._owned_ble_callback if slot.connection_mode == 'ble' else lambda cb: cb
         if (slot.rumble_desired <= 0.001
                 or not (slot.ble_connected or slot.conn_mgr.device)):
             self._rumble_pwm_timers.pop(slot_index, None)
@@ -2435,7 +2516,7 @@ class GCControllerEnabler:
 
         if off_ms <= 0:
             self._rumble_pwm_timers[slot_index] = self.root.after(
-                on_ms, lambda si=slot_index: self._rumble_cycle(si))
+                on_ms, guard(lambda si=slot_index: self._rumble_cycle(si)))
             return
 
         def _pulse_off(si=slot_index, gap=off_ms):
@@ -2447,14 +2528,14 @@ class GCControllerEnabler:
             if gap >= 2 * _RUMBLE_OFF_REPEAT_MS:
                 self.root.after(
                     _RUMBLE_OFF_REPEAT_MS,
-                    lambda: self._set_rumble_hardware(si, False, force=True))
+                    guard(lambda: self._set_rumble_hardware(si, False, force=True)))
             if self.slots[si].rumble_desired <= 0.001:
                 self._rumble_pwm_timers.pop(si, None)
                 return
             self._rumble_pwm_timers[si] = self.root.after(
-                gap, lambda: self._rumble_cycle(si))
+                gap, guard(lambda: self._rumble_cycle(si)))
 
-        self._rumble_pwm_timers[slot_index] = self.root.after(on_ms, _pulse_off)
+        self._rumble_pwm_timers[slot_index] = self.root.after(on_ms, guard(_pulse_off))
 
     def test_rumble(self, slot_index: int):
         """Send a short rumble burst (~500ms) to test the motor."""
@@ -2477,6 +2558,8 @@ class GCControllerEnabler:
             slot.rumble_desired = 0.0
             self._sync_rumble_output(slot_index)
 
+        if slot.connection_mode == 'ble':
+            _stop_rumble = self._owned_ble_callback(_stop_rumble)
         self.root.after(500, _stop_rumble)
 
     def _start_xbox360_emulation(self, slot_index: int):
@@ -2517,13 +2600,24 @@ class GCControllerEnabler:
         self.ui.update_emu_status(
             slot_index, t("emu.waiting_dolphin"))
 
+        owner = slot.ble_session if slot.connection_mode == 'ble' else None
+
+        def _complete(error=None):
+            if (slot._pipe_cancel is not cancel or cancel.is_set()
+                    or owner is not None and (slot.ble_session is not owner or owner.ended)):
+                return
+            if error is None:
+                self._on_pipe_connected(slot_index)
+            else:
+                self._on_pipe_failed(slot_index, error)
+
         def _connect():
             try:
                 slot.emu_mgr.start('dolphin_pipe', slot_index=slot_index,
                                    cancel_event=cancel)
-                self.root.after(0, lambda: self._on_pipe_connected(slot_index))
+                self.root.after(0, _complete)
             except Exception as e:
-                self.root.after(0, lambda err=e: self._on_pipe_failed(slot_index, err))
+                self.root.after(0, lambda err=e: _complete(err))
 
         threading.Thread(target=_connect, daemon=True).start()
 
@@ -2558,7 +2652,10 @@ class GCControllerEnabler:
             return
         # Wait until the controller is actually producing HID data before starting
         if self._latest_ui_data[slot_index] is None:
-            self.root.after(500, lambda si=slot_index: self._start_auto_calibration(si))
+            retry = lambda si=slot_index: self._start_auto_calibration(si)
+            if self.slots[slot_index].connection_mode == 'ble':
+                retry = self._owned_ble_callback(retry)
+            self.root.after(500, retry)
             return
         self.ui.update_status(slot_index, t("ui.auto_cal_starting"))
         self.calibration_sticks_step(slot_index)
@@ -2774,6 +2871,19 @@ class GCControllerEnabler:
 
     def _ui_poll(self):
         """Main-thread timer: apply latest input data for each slot."""
+        # Loss must not wait behind a backlog of now-obsolete status events.
+        session = self._ble_session
+        if session is not None and session.failure:
+            self._ble_service_lost(session)
+        for _ in range(64):
+            try:
+                session, event = self._ble_events.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                self._dispatch_ble_event(session, event)
+            except Exception:
+                logger.exception('BLE event handling failed')
         for slot_index in range(MAX_SLOTS):
             data = self._latest_ui_data[slot_index]
             if data is not None:
@@ -2915,6 +3025,9 @@ class GCControllerEnabler:
 
     def _actual_quit(self):
         """Perform full application shutdown and destroy the window."""
+        self._ble_closing = True
+        if self._ble_session:
+            self._ble_session.end()
         # Stop USB hotplug polling
         self._stop_usb_hotplug()
 
@@ -2931,14 +3044,8 @@ class GCControllerEnabler:
             slot.emu_mgr.stop()
             slot.conn_mgr.disconnect()
 
-        # Clean up BLE subprocess
-        if self._ble_subprocess:
-            try:
-                self._send_ble_cmd({"cmd": "shutdown"})
-                self._ble_subprocess.wait(timeout=5.0)
-            except Exception:
-                pass
-            self._cleanup_ble()
+        # Stdin EOF requests backend cleanup after intentional retirement.
+        self._cleanup_ble()
 
         self.root.destroy()
 
@@ -2986,8 +3093,7 @@ class _BleHeadlessManager:
         self._subprocess = None
         self._reader_thread = None
         self._initialized = False
-        self._init_event = threading.Event()
-        self._init_result = None
+        self._session = None
 
     def start_subprocess(self):
         """Start the BLE subprocess. Uses pkexec on Linux, direct spawn on macOS/Windows."""
@@ -3021,30 +3127,24 @@ class _BleHeadlessManager:
                 stderr=subprocess.DEVNULL,
             )
 
-    def send_cmd(self, cmd: dict):
-        """Send a JSON-line command to the BLE subprocess."""
-        if self._subprocess and self._subprocess.poll() is None:
+        self._session = HelperSession(self._subprocess)
+
+    def send_cmd(self, cmd: dict, session=None):
+        session = session or self._session
+        if session is not self._session or session is None or session.ended:
+            return
+        proc = session.process
+        if proc.poll() is None:
             try:
                 line = json.dumps(cmd, separators=(',', ':')) + '\n'
-                self._subprocess.stdin.write(line.encode('utf-8'))
-                self._subprocess.stdin.flush()
+                proc.stdin.write(line.encode('utf-8'))
+                proc.stdin.flush()
             except Exception:
                 pass
 
-    def _wait_init(self, timeout: float) -> dict | None:
-        """Block until the next init event from the BLE subprocess."""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self._subprocess and self._subprocess.poll() is not None:
-                return None
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None
-            if self._init_event.wait(timeout=min(remaining, 0.5)):
-                result = self._init_result
-                self._init_event.clear()
-                return result
-        return None
+    def _wait_init(self, timeout: float, session=None) -> dict | None:
+        session = session or self._session
+        return session.wait_init(timeout) if session else None
 
     def init_ble(self, on_data, on_event) -> bool:
         """Full init sequence: spawn → start reader → wait ready → stop_bluez → open HCI.
@@ -3069,118 +3169,88 @@ class _BleHeadlessManager:
             return False
 
         # Start reader thread immediately so it can receive init-phase events
+        session = self._session
         self.start_reader(on_data, on_event)
 
         # Wait for subprocess to start (user authenticates via pkexec)
-        result = self._wait_init(timeout=60)
+        result = self._wait_init(timeout=60, session=session)
         if not result or result.get('e') != 'ready':
-            self.shutdown()
+            self.shutdown(session)
             print("BLE Error: BLE service failed to start. "
                   "Authentication may have been cancelled.")
             return False
 
         # Stop BlueZ (must release HCI adapter for Bumble)
-        self.send_cmd({"cmd": "stop_bluez"})
-        result = self._wait_init(timeout=15)
+        self.send_cmd({"cmd": "stop_bluez"}, session)
+        result = self._wait_init(timeout=15, session=session)
         if not result or result.get('e') != 'bluez_stopped':
-            self.shutdown()
+            self.shutdown(session)
             print("BLE Error: Failed to stop BlueZ.")
             return False
 
         # Open HCI adapter
-        self.send_cmd({"cmd": "open"})
-        result = self._wait_init(timeout=15)
+        self.send_cmd({"cmd": "open"}, session)
+        result = self._wait_init(timeout=15, session=session)
         if not result or result.get('e') == 'error':
             msg = result.get('msg', 'Unknown error') if result else 'Timeout'
-            self.shutdown()
+            self.shutdown(session)
             print(f"BLE Error: Failed to initialize BLE: {msg}")
             print("Make sure a Bluetooth adapter is connected.")
             return False
 
-        self._initialized = True
+        with session.condition:
+            if self._session is not session or session.ended:
+                return False
+            session.initialized = self._initialized = True
         return True
 
     def start_reader(self, on_data, on_event):
-        """Start the event reader thread.
-
-        Args:
-            on_data: callback(slot_index, data_bytes) for low-latency data events
-            on_event: callback(event_dict) for runtime events (connected, disconnected, etc.)
-        """
+        session = self._session
         self._reader_thread = threading.Thread(
-            target=self._event_reader, args=(on_data, on_event), daemon=True)
+            target=self._event_reader, args=(on_data, on_event, session), daemon=True)
         self._reader_thread.start()
 
-    def _event_reader(self, on_data, on_event):
-        """Read events from the BLE subprocess stdout (runs in a thread).
+    def _event_reader(self, on_data, on_event, session=None):
+        session = session or self._session
+        reason = 'BLE helper closed its output'
 
-        Handles two formats on the binary stdout stream:
-        - Binary data packets: 0xFF + slot(1) + payload(64) = 66 bytes
-        - JSON text lines: UTF-8 encoded, terminated by newline
-        """
+        def data(si, payload):
+            with session.condition:
+                if self._session is session and not session.ended:
+                    on_data(si, payload)
+
+        def event(value):
+            if self._session is not session or session.ended:
+                return
+            if not session.initialized and value['e'] in (
+                    'ready', 'bluez_stopped', 'open_ok', 'error'):
+                session.init_event(value)
+            else:
+                on_event({**value, '_session': session})
+
         try:
-            stdout = self._subprocess.stdout
-            while True:
-                header = stdout.read(1)
-                if not header:
-                    break
-                if header[0] == 0xFF:
-                    packet = stdout.read(65)
-                    if len(packet) < 65:
-                        break
-                    si = packet[0]
-                    on_data(si, packet[1:65])
-                    continue
+            read_event_stream(session.process.stdout, data, event)
+        except Exception as exc:
+            reason = f'BLE input failed: {type(exc).__name__}: {exc}'
+        finally:
+            if session.end(reason):
+                on_event({'e': '_service_lost', '_session': session})
 
-                rest = stdout.readline()
-                line = (header + rest).decode('utf-8', errors='replace').strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                etype = event.get('e')
-
-                if not self._initialized and etype in (
-                        'ready', 'bluez_stopped', 'open_ok', 'error'):
-                    self._init_result = event
-                    self._init_event.set()
-                    continue
-
-                on_event(event)
-        except Exception:
-            pass
-
-    def shutdown(self):
-        """Send shutdown, terminate process."""
-        if self._subprocess:
-            try:
-                self.send_cmd({"cmd": "shutdown"})
-                self._subprocess.wait(timeout=5.0)
-            except Exception:
-                pass
-            try:
-                self._subprocess.stdin.close()
-            except Exception:
-                pass
-            try:
-                self._subprocess.terminate()
-                self._subprocess.wait(timeout=3)
-            except Exception:
-                try:
-                    self._subprocess.kill()
-                except Exception:
-                    pass
+    def shutdown(self, session=None):
+        session = session or self._session
+        if session is None:
+            return
+        session.end()
+        if self._session is session:
             self._subprocess = None
-        self._initialized = False
+            self._initialized = False
+        close_helper(session)
 
     @property
     def is_alive(self) -> bool:
-        return (self._subprocess is not None
-                and self._subprocess.poll() is None
-                and self._initialized)
+        return (self._session is not None and not self._session.ended
+                and self._subprocess is not None
+                and self._subprocess.poll() is None and self._initialized)
 
 
 def run_headless(mode_override: str = None):
@@ -3279,9 +3349,12 @@ def run_headless(mode_override: str = None):
     rumble_tids = [0] * MAX_SLOTS
     rumble_states = [False] * MAX_SLOTS
 
-    def _make_headless_rumble_cb(slot_idx, conn_mgr_ref=None):
+    def _make_headless_rumble_cb(slot_idx, conn_mgr_ref=None, owner=None):
         """Create a rumble callback for headless mode (USB or BLE)."""
         def _on_rumble(large_motor, small_motor):
+            if owner is not None and (ble_mgr is None or ble_mgr._session is not owner
+                                      or owner.ended):
+                return
             new_state = (large_motor > 0 or small_motor > 0)
             if new_state == rumble_states[slot_idx]:
                 return
@@ -3300,7 +3373,7 @@ def run_headless(mode_override: str = None):
                     "cmd": "rumble",
                     "slot_index": slot_idx,
                     "data": base64.b64encode(packet).decode('ascii'),
-                })
+                }, owner)
             elif conn_mgr_ref and conn_mgr_ref.device:
                 conn_mgr_ref.send_rumble(new_state)
         return _on_rumble
@@ -3410,8 +3483,8 @@ def run_headless(mode_override: str = None):
         if q is not None:
             try:
                 q.put_nowait(data_bytes)
-            except _queue.Full:
-                pass
+            except _queue.Full as exc:
+                raise BufferError('BLE input queue exhausted') from exc
 
     def _on_ble_event(event):
         """Runtime event callback from the reader thread."""
@@ -3458,6 +3531,29 @@ def run_headless(mode_override: str = None):
         """Process a BLE runtime event in the main loop."""
         nonlocal ble_scanning_slot
 
+        owner = event.get('_session')
+        if owner is None:
+            return
+        if event.get('e') == '_service_lost':
+            if not owner.claim_loss():
+                return
+            if ble_mgr and ble_mgr._session is owner:
+                ble_scanning_slot = None
+                ble_pending_reconnects.clear()
+            for info in list(active_slots):
+                if info.get('ble_session') is not owner or info['type'] != 'ble':
+                    continue
+                retire_input(info['input_proc'], info['emu_mgr'])
+                active_slots.remove(info)
+                ble_data_queues.pop(info['index'], None)
+                rumble_states[info['index']] = False
+            if ble_mgr:
+                ble_mgr.shutdown(owner)
+            print(f'BLE service stopped: {owner.failure}. USB remains available.')
+            return
+        if ble_mgr is None or ble_mgr._session is not owner or owner.ended:
+            return
+
         etype = event.get('e')
         si = event.get('s')
 
@@ -3502,13 +3598,19 @@ def run_headless(mode_override: str = None):
             print(f"[slot {si + 1}] Starting {mode_label} emulation...")
 
             try:
-                rumble_cb = _make_headless_rumble_cb(si)
-                emu_mgr.start(slot_mode, slot_index=si, rumble_callback=rumble_cb)
+                rumble_cb = _make_headless_rumble_cb(si, owner=owner)
+                emu_mgr.start(slot_mode, slot_index=si, rumble_callback=rumble_cb,
+                              cancel_event=owner.stop_event)
                 if slot_mode == 'dsu':
                     port = getattr(emu_mgr.gamepad, 'port', 26760)
                     print(f"[slot {si + 1}] DSU server on port {port}")
             except Exception as e:
                 print(f"[slot {si + 1}] Failed to start emulation: {e}")
+                ble_data_queues.pop(si, None)
+                return
+
+            if owner.ended or ble_mgr._session is not owner:
+                emu_mgr.stop()
                 ble_data_queues.pop(si, None)
                 return
 
@@ -3536,6 +3638,7 @@ def run_headless(mode_override: str = None):
                 'device_path': None,
                 'disc_event': disc_event,
                 'ble_address': mac,
+                'ble_session': owner,
             })
 
             ble_scanning_slot = None
@@ -3554,16 +3657,16 @@ def run_headless(mode_override: str = None):
                 # Targeted reconnect failed — retry after 3 seconds
                 mac = ble_pending_reconnects[si]
                 if not stop_event.is_set():
-                    threading.Timer(3.0, lambda _si=si, _mac=mac:
+                    threading.Timer(3.0, lambda _si=si, _mac=mac, _owner=owner:
                         ble_event_queue.put(
-                            {'e': '_retry_reconnect', 's': _si, 'mac': _mac}
+                            {'e': '_retry_reconnect', 's': _si, 'mac': _mac, '_session': _owner}
                         )).start()
             else:
                 # General scan failed — retry after 3 seconds
                 ble_scanning_slot = None
                 if not stop_event.is_set():
-                    threading.Timer(3.0, lambda: ble_event_queue.put(
-                        {'e': '_retry_scan'})).start()
+                    threading.Timer(3.0, lambda _owner=owner: ble_event_queue.put(
+                        {'e': '_retry_scan', '_session': _owner})).start()
 
         elif etype == 'disconnected' and si is not None:
             # Find the active slot info
@@ -3869,6 +3972,7 @@ def run_scan_debug(timeout: float = 10.0):
 
 
 # ── Single-instance lock ──────────────────────────────────────────────
+
 
 def _get_lock_path() -> str:
     """Return a platform-appropriate path for the instance lock file."""
