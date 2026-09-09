@@ -48,6 +48,7 @@ class ControllerSlot:
         self.ble_address: Optional[str] = None
         self.ble_data_queue: queue.Queue = queue.Queue(maxsize=64)
         self.ble_connected: bool = False
+        self.ble_session = None  # Owning helper; never persisted.
 
         # Rumble state
         self.rumble_tid: int = 0
