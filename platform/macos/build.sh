@@ -1,31 +1,40 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-echo "Building NSO GameCube Controller Pairing App for macOS..."
-
-# Check if virtual environment exists
-if [ ! -d ".venv" ]; then
-    echo "Creating virtual environment..."
-    python3 -m venv .venv
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$ROOT"
+if [[ "$(uname -s)" != Darwin ]]; then
+    echo "Build the macOS app on a Mac." >&2
+    exit 1
 fi
 
-# Activate virtual environment
-source .venv/bin/activate
+# Dependencies are installed on the BUILD machine, never on an end user's Mac.
+PYTHON="${PYTHON:-python3}"
+VENV="${MACOS_BUILD_VENV:-$ROOT/.venv-macos}"
+"$PYTHON" -m venv "$VENV"
+"$VENV/bin/python" -m pip install -r requirements.txt
+"$VENV/bin/python" -c 'import tkinter, CoreBluetooth, bleak.backends.corebluetooth.client'
+"$VENV/bin/python" -m PyInstaller --clean --noconfirm --distpath dist/macos gc_controller_enabler.spec
 
-# Install dependencies
-echo "Installing dependencies..."
-pip install -r requirements.txt
+APP="$ROOT/dist/macos/NSO-GameCube-Controller-Pairing-App.app"
+"$VENV/bin/python" platform/macos/verify_bundle.py "$APP"
+ARCH="$(uname -m)"
+ZIP="$ROOT/dist/macos/NSO-GameCube-Controller-Pairing-App-macOS-$ARCH.zip"
+/usr/bin/ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
 
-# Create build directory
-mkdir -p dist
-
-# Build executable with PyInstaller using the project spec file
-echo "Building executable..."
-pyinstaller --distpath dist/macos gc_controller_enabler.spec
-
-echo "Build complete! Executable is in dist/macos/"
-echo ""
-echo "Note: On macOS, you may need to:"
-echo "1. Install libusb: brew install libusb"
-echo "2. Grant USB permissions in System Preferences > Security & Privacy"
-echo "3. Xbox 360 emulation requires additional drivers"
+# Optional release notarization. Credentials remain in the builder's keychain.
+if [[ -n "${MACOS_NOTARY_PROFILE:-}" ]]; then
+    if [[ -z "${MACOS_CODESIGN_IDENTITY:-}" ]]; then
+        echo "MACOS_NOTARY_PROFILE requires MACOS_CODESIGN_IDENTITY." >&2
+        exit 1
+    fi
+    xcrun notarytool submit "$ZIP" --keychain-profile "$MACOS_NOTARY_PROFILE" --wait
+    xcrun stapler staple "$APP"
+    xcrun stapler validate "$APP"
+    /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+else
+    echo "Development artifact only: this build has not been notarized."
+fi
+printf '\nBuilt: %s\n' "$ZIP"
+echo "Users copy the app to Applications; Python, pip, Bleak and Homebrew are not required."
+echo "Current macOS game output remains Dolphin pipe / DSU, not system-wide virtual HID."

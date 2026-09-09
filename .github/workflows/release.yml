@@ -51,31 +51,32 @@ jobs:
           path: dist/NSO-GameCube-Controller-Pairing-App-Linux.zip
 
   build-macos:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: 'pip'
-
-      - name: Install system dependencies
-        run: brew install libusb python-tk@3.12
-
-      - name: Install Python dependencies
-        run: pip install -r requirements.txt
-
-      - name: Build with PyInstaller
-        run: pyinstaller gc_controller_enabler.spec
-
-      - name: Zip macOS app bundle
-        run: cd dist && zip -r NSO-GameCube-Controller-Pairing-App-macOS.zip NSO-GameCube-Controller-Pairing-App.app
-
+          cache: pip
+      - name: Install build-only native dependency
+        run: brew install libusb
+      - name: Build and verify relocated app
+        env:
+          PYTHON: python
+        run: bash platform/macos/build.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: NSO-GameCube-Controller-Pairing-App-macOS
-          path: dist/NSO-GameCube-Controller-Pairing-App-macOS.zip
+          name: NSO-GameCube-Controller-Pairing-App-macOS-${{ matrix.arch }}
+          path: dist/macos/NSO-GameCube-Controller-Pairing-App-macOS-${{ matrix.arch }}.zip
+          if-no-files-found: error
 
   build-windows:
     runs-on: windows-latest
@@ -116,5 +117,5 @@ jobs:
           generate_release_notes: true
           files: |
             NSO-GameCube-Controller-Pairing-App-Linux/NSO-GameCube-Controller-Pairing-App-Linux.zip
-            NSO-GameCube-Controller-Pairing-App-macOS/NSO-GameCube-Controller-Pairing-App-macOS.zip
+            NSO-GameCube-Controller-Pairing-App-macOS-*/*.zip
             NSO-GameCube-Controller-Pairing-App-Windows/NSO-GameCube-Controller-Pairing-App-Windows.zip

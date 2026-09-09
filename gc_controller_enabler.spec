@@ -2,7 +2,7 @@
 
 import sys
 import os
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 # Determine if we're building for Windows, macOS, or Linux
 if sys.platform == "win32":
@@ -86,16 +86,18 @@ if os.path.isdir(_assets_dir):
 # enumeration fails with "No backend available".
 if sys.platform == "darwin":
     import ctypes.util
-    _libusb = ctypes.util.find_library('usb-1.0')
-    if _libusb:
-        binaries.append((_libusb, '.'))
-    else:
-        # Fallback: check common Homebrew paths
-        for _p in ('/opt/homebrew/lib/libusb-1.0.dylib',
-                    '/usr/local/lib/libusb-1.0.dylib'):
-            if os.path.exists(_p):
-                binaries.append((_p, '.'))
-                break
+    _candidates = [
+        os.environ.get('GC_LIBUSB_PATH'),
+        ctypes.util.find_library('usb-1.0'),
+        '/opt/homebrew/lib/libusb-1.0.dylib',
+        '/usr/local/lib/libusb-1.0.dylib',
+    ]
+    _libusb = next((p for p in _candidates
+                    if p and os.path.isabs(p) and os.path.isfile(p)), None)
+    if not _libusb:
+        raise SystemExit('macOS build requires libusb on the builder. '
+                         'Install it with brew install libusb or set GC_LIBUSB_PATH.')
+    binaries.append((_libusb, '.'))
 elif sys.platform == "linux":
     import ctypes.util, ctypes
     _libusb_name = ctypes.util.find_library('usb-1.0')
@@ -195,8 +197,11 @@ if sys.platform == "win32":
         'pystray._util.win32',
     ]
 elif sys.platform == "darwin":
+    # The backend and PyObjC frameworks are selected dynamically at runtime.
+    hiddenimports += collect_submodules('bleak.backends.corebluetooth')
     hiddenimports += [
         'bleak',
+        'CoreBluetooth',
         'gc_controller.ble',
         'gc_controller.ble.bleak_backend',
         'gc_controller.ble.bleak_subprocess',
@@ -274,7 +279,7 @@ if sys.platform == "darwin":
         disable_windowed_traceback=False,
         argv_emulation=False,
         target_arch=None,
-        codesign_identity=None,
+        codesign_identity=os.environ.get('MACOS_CODESIGN_IDENTITY'),
         entitlements_file=None,
         icon=_icon,
     )
